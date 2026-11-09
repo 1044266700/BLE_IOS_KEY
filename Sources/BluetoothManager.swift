@@ -139,6 +139,7 @@ class BluetoothManager: NSObject, ObservableObject {
         
         connectedPeripheral = peripheral
         peripheral.delegate = self
+        self.statusText = "正在连接 \(deviceName)..."
         centralManager.connect(peripheral, options: nil)
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
@@ -162,6 +163,7 @@ class BluetoothManager: NSObject, ObservableObject {
         responseReadFallback = nil
         isConnected = false
         isScanning = false
+        isAuthenticated = false
         filteredRSSI = nil
         isUnlocked = false
         isNearStable = false
@@ -244,16 +246,16 @@ class BluetoothManager: NSObject, ObservableObject {
             return
         }
         guard let proof = aesECBEncrypt(data: Data(data.suffix(16))),
-            peripheral == connectedPeripheral,
+            let peripheral == connectedPeripheral,
             let challenge = challengeCharacteristic else{
             authenticationFailed("生成手机认证应答失败")
             return
         }
         responseReadFallback?.cancel()
         responseReadFallback = nil
-        phoneNone = nil
+        phoneNonce = nil
         authState = .waitingForProofWrite
-        stateText = "模块已验证，正在验证手机..."
+        statusText = "模块已验证，正在验证手机..."
 
         // 第二步返回 AES(module_nonce)，此时还不能宣告双向认证成功。
         peripheral.writeValue(proof, for: challenge, type: .withResponse)
@@ -263,18 +265,18 @@ class BluetoothManager: NSObject, ObservableObject {
         responseReadFallback?.cancel()
         authenticationTimeout = nil
         responseReadFallback = nil
-        phoneNone = nil
+        phoneNonce = nil
         commandSequence = 0
         authState = .authenticated
         isAuthenticated = true
         statusText = "双向认证完成"
     }   
-    private func authenticationFailed(){
+    private func authenticationFailed(_ message: String){
         authenticationTimeout?.cancel()
         responseReadFallback?.cancel()
         authenticationTimeout = nil
         responseReadFallback = nil
-        phoneNone = nil
+        phoneNonce = nil
         authState = .idle
         isAuthenticated = false
         statusText = message
@@ -341,7 +343,7 @@ class BluetoothManager: NSObject, ObservableObject {
 
 
         commandSequence = sequence
-        pendingCommand = pendingCommand = command 
+        pendingCommand = command 
         statusText = "正在发送\(command.title)指令..."
         peripheral.writeValue(encrypted, for: characteristic, type: .withResponse)
     }
@@ -408,7 +410,7 @@ class BluetoothManager: NSObject, ObservableObject {
             &outLength
         )
         
-        guard status == kCCSuccess, outLength ==  kCCKeySizeAES128 else {
+        guard status == kCCSuccess, outLength ==  kCCBlockSizeAES128 else {
             print("CCCrypt error: \(status)")
             return nil
         }
@@ -439,11 +441,11 @@ extension BluetoothManager: CBCentralManagerDelegate {
         }
     }
     
-    func centralManager(_ central: CBCentralManager, didDiscover c: CBPeripheral,
+    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any], rssi RSSI: NSNumber) {
         guard connectedPeripheral == nil else { return }
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        guard advertisedName = deviceName || peripheral.name == deviceName else { return }
+        guard advertisedName == deviceName || peripheral.name == deviceName else { return }
         connect(to: peripheral)
     }
     
@@ -482,7 +484,7 @@ extension BluetoothManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard connectedPeripheral === peripheral else { return }
         if let error = error{
-            statusText = "服务发现失败: \(error?.localizedDescription)"
+            statusText = "服务发现失败: \(error.localizedDescription)"
             return
         }
         guard let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
