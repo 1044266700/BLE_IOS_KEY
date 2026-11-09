@@ -23,5 +23,8 @@ targets:
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: UIInterfaceOrientationPortrait
+        INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription: "需要使用蓝牙连接钥匙"
+        INFOPLIST_KEY_NSBluetoothPeripheralUsageDescription: "需要使用蓝牙连接钥匙"
+        INFOPLIST_KEY_UIBackgroundModes: [bluetooth-central]
     scheme:
       testTargets: []
