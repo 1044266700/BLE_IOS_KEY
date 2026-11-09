@@ -212,28 +212,172 @@ class BluetoothManager: NSObject, ObservableObject {
     }
 //TODO
     private func startAuthentication() {
-        guard let characteristic = challengeCharacteristic else { return }
-        
-        // 生成 16 字节 phone_nonce
-        var randomBytes = [UInt8](repeating: 0, count: 16)
-        guard SecRandomCopyBytes(kSecRandomDefault, 16, &randomBytes) == errSecSuccess else {
-            statusText = "生成随机数失败"
+        guard let peripheral = connectedPeripheral,
+              let characteristic = challengeCharacteristic,
+              authState == .waitingForResponseNotification || authState == .idle,
+              let nonce = randomBytes(count: 16) else {
+            if authState != .authenticated {
+                authenticationFailed("无法开始认证")
+            }
             return
         }
-        
-        phoneNonce = Data(randomBytes)
-        
-        // AES-128-ECB 加密后写入 Challenge 特征
-        guard let encrypted = aesECBEncrypt(data: Data(randomBytes)) else {
-            statusText = "加密失败"
-            return
-        }
-        
-        authStep = 1
+
+        phoneNonce = Data(nonce)
+        authState = .waitingForChallengeWrite
+        isAuthenticated = false
         statusText = "正在进行双向认证..."
-        connectedPeripheral?.writeValue(encrypted, for: characteristic, type: .withResponse)
+
+        // 第一步必须写原始 phone_nonce，由模块计算 AES(phone_nonce)。
+        peripheral.writeValue(Data(nonce), for: characteristic, type: .withResponse)
     }
-    
+
+    private func handleModuleResponse(_ data: Data){
+        guard authState == .waitingForModuleResponse else { return }
+        guard data.count == 32 else{
+            authenticationFailed("认证长度错误 ： \(data.count)字节")
+            return
+        }
+        guard let expectedNonce = phoneNonce,
+            let decrypted = aesECBDecrypt(data: Data(data.prefix(16))),
+            decrypted == expectedNonce else{
+            authenticationFailed("模块认证失败：随机数不匹配")
+            return
+        }
+        guard let proof = aesECBEncrypt(data: Data(data.suffix(16))),
+            peripheral == connectedPeripheral,
+            let challenge = challengeCharacteristic else{
+            authenticationFailed("生成手机认证应答失败")
+            return
+        }
+        responseReadFallback?.cancel()
+        responseReadFallback = nil
+        phoneNone = nil
+        authState = .waitingForProofWrite
+        stateText = "模块已验证，正在验证手机..."
+
+        // 第二步返回 AES(module_nonce)，此时还不能宣告双向认证成功。
+        peripheral.writeValue(proof, for: challenge, type: .withResponse)
+    }
+    private func completeAuthentication(){
+        authenticationTimeout?.cancel()
+        responseReadFallback?.cancel()
+        authenticationTimeout = nil
+        responseReadFallback = nil
+        phoneNone = nil
+        commandSequence = 0
+        authState = .authenticated
+        isAuthenticated = true
+        statusText = "双向认证完成"
+    }   
+    private func authenticationFailed(){
+        authenticationTimeout?.cancel()
+        responseReadFallback?.cancel()
+        authenticationTimeout = nil
+        responseReadFallback = nil
+        phoneNone = nil
+        authState = .idle
+        isAuthenticated = false
+        statusText = message
+    }
+    private func scheduleAuthenticationTimeout(){
+        authenticationTimeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                self.isConnected,
+                self.authState != .authenticated else { return }
+                self.authenticationFailed("认证超时，请断开后重新连接")
+            }
+        authenticationTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    }
+    private func scheduleResponseReadFallback(){
+        responseReadFallback?.cancel()
+        let read = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                self.authState == .waitingForModuleResponse,
+                let peripheral = self.connectedPeripheral,
+                let response = self.responseCharacteristic else { return }
+                peripheral.readValue(for:response)                     
+            }
+        responseReadFallback  = read
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: read)
+    }
+
+    private func sendCommand(_ command: KeyCommand) {
+        guard isConnected,
+        isAuthenticated,
+        authState == .authenticated,
+        let peripheral = connectedPeripheral,
+        let characteristic = commandCharacteristic else {
+            statusText = "请先完成双向认证"
+            return
+        }
+        guard pendingCommand = nil else{
+            statusText = "上一条指令尚未确认，请稍后"
+            return
+        }
+        guard commandSequence < UInt32.max else{
+            statusText = "指令序号已用尽，请重新连接"
+            return
+        }
+        guard let padding = randomBytes(count: 11) else{
+            statusText = "生成指令随机数失败"
+            return
+        }
+        
+        let sequence = commandSequence + 1
+        var plaintext = [UInt8](repeating: 0, count: 16)
+        plaintext[0] = command.rawValue
+        plaintext[1] = UInt8(truncatingIfNeeded: sequence)
+        plaintext[2] = UInt8(truncatingIfNeeded: sequence >> 8)
+        plaintext[3] = UInt8(truncatingIfNeeded: sequence >> 16)
+        plaintext[4] = UInt8(truncatingIfNeeded: sequence >> 24)
+        plaintext.replaceSubrange(5..<16, with: padding)
+
+        guard let encrypted = aesECBEncrypt(data: Data(plaintext)) else{
+            statusText = "指令加密失败"
+            return
+        }
+
+
+        commandSequence = sequence
+        pendingCommand = pendingCommand = command 
+        statusText = "正在发送\(command.title)指令..."
+        peripheral.writeValue(encrypted, for: characteristic, type: .withResponse)
+    }
+
+//MARK 状态与随机数
+    private func handleStatus(_ data: Data) {
+        guard data.count == 1 else{
+            if authState == .waitingForAuthenticationStatus {
+                authenticationFailed("模块状态长度错误")
+            }
+            return
+        }
+        let status = data[0]
+        let moduleAuthenticated  = status & (1 << 0) != 0
+        let  wasAuthenticated = isAuthenticated
+
+        isAuthenticated = moduleAuthenticated
+        isUnlocked = status & (1 << 1) != 0
+        isNearStable = status & (1 << 2) != 0
+        isApproachArmed = status & (1 << 3) != 0
+        isCalibrating = status & (1 << 4) != 0
+
+        ifmoduleAuthenticated && authState != .authenticated {
+            completeAuthentication()
+        }else if !moduleAuthenticated && (wasAuthenticated || authState == .authenticated){
+            authState = .idle
+            pendingCommand = nil
+            statusText = "模块认证已失效，请重新连接"
+        }
+    }
+
+    private func randomBytes(count: Int) -> [UInt8]? {
+        var bytes = [UInt8](repeating: 0, count: count)
+        let result = SecRandomCopyBytes(kSecRandomDefault, count, &bytes)
+        return result == errSecSuccess ? bytes : nil
+    }
     // MARK: - AES-128-ECB
     private func aesECBEncrypt(data: Data) -> Data? {
         return crypt(data: data, operation: CCOperation(kCCEncrypt))
@@ -246,8 +390,9 @@ class BluetoothManager: NSObject, ObservableObject {
     private func crypt(data: Data, operation: CCOperation) -> Data? {
         guard data.count == kCCBlockSizeAES128 else { return nil }
         
-        var outLength = Int(0)
+        var outLength = 0
         var outBytes = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
+        let inputBytes = [UInt8](data)
         
         let status = CCCrypt(
             operation,
@@ -256,19 +401,19 @@ class BluetoothManager: NSObject, ObservableObject {
             aesKey,
             kCCKeySizeAES128,
             nil,
-            Array(data),
-            data.count,
+            inputBytes,
+            inputBytes.count,
             &outBytes,
             kCCBlockSizeAES128,
             &outLength
         )
         
-        guard status == kCCSuccess else {
+        guard status == kCCSuccess, outLength ==  kCCKeySizeAES128 else {
             print("CCCrypt error: \(status)")
             return nil
         }
         
-        return Data(outBytes.prefix(outLength))
+        return Data(outBytes)
     }
 }
 
@@ -277,114 +422,206 @@ extension BluetoothManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
-            statusText = "蓝牙已开启，可以开始扫描"
+            if connectedPeripheral == nil && !isScanning {
+                statusText = "蓝牙已开启，可以开始扫描"
+            }
         case .poweredOff:
+            clearConnectionState()
             statusText = "蓝牙已关闭"
-            resetState()
         case .unauthorized:
+            clearConnectionState()
             statusText = "没有蓝牙权限"
+        case .unsupported:
+            clearConnectionState()
+            statusText = "当前设备不支持蓝牙"
         default:
-            statusText = "蓝牙状态异常"
+            statusText = "蓝牙不可用"
         }
     }
     
-    func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
+    func centralManager(_ central: CBCentralManager, didDiscover c: CBPeripheral,
                         advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        guard let name = peripheral.name, !name.isEmpty else { return }
-        statusText = "发现设备: \(name)"
+        guard connectedPeripheral == nil else { return }
+        let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        guard advertisedName = deviceName || peripheral.name == deviceName else { return }
         connect(to: peripheral)
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard connectedPeripheral === peripheral else { return }
+        connectionTimeout?.cancel()
+        connectionTimeout = nil
         isConnected = true
+        isScanning = false
         statusText = "已连接，正在发现服务..."
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
         peripheral.discoverServices([serviceUUID])
     }
     
-    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        statusText = "连接失败: \(error?.localizedDescription ?? "")"
-        resetState()
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, 
+                        error: Error?) {
+        guard connectedPeripheral === peripheral else { return }
+        clearConnectionState()
+        statusText = "连接失败: \(error?.localizedDescription ?? "未知错误")"
     }
     
-    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        statusText = "连接断开"
-        resetState()
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, 
+                        error: Error?) {
+        guard connectedPeripheral === peripheral else { return }
+        clearConnectionState()
+        if let error = error {
+            statusText = "连接断开: \(error?.localizedDescription)"
+        } else {
+            statusText = "连接已断开"
+        }
     }
 }
 
 // MARK: - CBPeripheralDelegate
 extension BluetoothManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard let services = peripheral.services else { return }
-        for service in services {
-            peripheral.discoverCharacteristics([
-                challengeUUID,
-                responseUUID,
-                commandUUID,
-                statusUUID
-            ], for: service)
+        guard connectedPeripheral === peripheral else { return }
+        if let error = error{
+            statusText = "服务发现失败: \(error?.localizedDescription)"
+            return
         }
+        guard let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
+            statusText = "未找到车钥匙服务"
+            return
+        }
+
+        peripheral.discoverCharacteristics([
+            challengeUUID,
+            responseUUID,
+            commandUUID,
+            rssiUUID,
+            statusUUID
+        ], for: service)
     }
-    
-    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
-        guard let characteristics = service.characteristics else { return }
-        
-        for char in characteristics {
-            switch char.uuid {
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
+                    error: Error?) {
+        guard connectedPeripheral === peripheral, service.uuid == serviceUUID else { return }
+        if let error = error {
+            statusText = "特征发现失败：\(error.localizedDescription)"
+            return
+        }
+
+        for characteristic in service.characteristics ?? [] {
+            switch characteristic.uuid {
             case challengeUUID:
-                challengeCharacteristic = char
+                challengeCharacteristic = characteristic
             case responseUUID:
-                responseCharacteristic = char
-                peripheral.setNotifyValue(true, for: char)   // 打开通知
+                responseCharacteristic = characteristic
             case commandUUID:
-                commandCharacteristic = char
+                commandCharacteristic = characteristic
+            case rssiUUID:
+                rssiCharacteristic = characteristic
             case statusUUID:
-                statusCharacteristic = char
+                statusCharacteristic = characteristic
             default:
                 break
             }
         }
-        
-        // 关键特征和响应特征都准备好后开始认证
-        if challengeCharacteristic != nil && responseCharacteristic != nil {
-            startAuthentication()
-        }
+
+        prepareAuthentication()
     }
-    
-    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
-        guard let data = characteristic.value else { return }
-        
-        // 只处理 Response 特征的数据
-        guard characteristic.uuid == responseUUID else { return }
-        
-        if authStep == 1 {
-            // 期望收到至少 32 字节：
-            // 前16字节 = AES-128-ECB(phone_nonce)
-            // 后16字节 = module_nonce（明文）
-            guard data.count >= 32 else {
-                statusText = "认证数据包长度错误 (\(data.count))"
-                return
-            }
-            
-            let encryptedPhoneNonce = data.prefix(16)
-            
-            guard let decrypted = aesECBDecrypt(data: Data(encryptedPhoneNonce)),
-                  decrypted == phoneNonce else {
-                statusText = "认证失败（随机数不匹配）"
-                return
-            }
-            
-            // 认证成功
-            authStep = 2
-            isAuthenticated = true
-            statusText = "认证完成"
-        }
-    }
-    
-    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+    func peripheral(_ peripheral: CBPeripheral,
+                    didUpdateNotificationStateFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard connectedPeripheral === peripheral else { return }
         if let error = error {
-            statusText = "写入失败: \(error.localizedDescription)"
+            if characteristic.uuid == responseUUID {
+                authenticationFailed("订阅认证响应失败：\(error.localizedDescription)")
+            } else {
+                statusText = "订阅通知失败：\(error.localizedDescription)"
+            }
+            return
+        }
+
+        guard characteristic.uuid == responseUUID else { return }
+        if characteristic.isNotifying {
+            if authState == .waitingForResponseNotification {
+                startAuthentication()
+            }
+        } else if authState != .authenticated {
+            authenticationFailed("认证响应通知未开启")
+        }
+    }
+
+
+func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard connectedPeripheral === peripheral else { return }
+        if let error = error {
+            switch characteristic.uuid {
+            case responseUUID:
+                if authState == .waitingForModuleResponse {
+                    authenticationFailed("读取认证响应失败：\(error.localizedDescription)")
+                }
+            case statusUUID:
+                if authState == .waitingForAuthenticationStatus {
+                    authenticationFailed("读取认证状态失败：\(error.localizedDescription)")
+                }
+            default:
+                break
+            }
+            return
+        }
+        guard let data = characteristic.value else { return }
+
+        switch characteristic.uuid {
+        case responseUUID:
+            handleModuleResponse(data)
+        case rssiUUID:
+            guard data.count == 1 else { return }
+            filteredRSSI = Int(Int8(bitPattern: data[0]))
+        case statusUUID:
+            handleStatus(data)
+        default:
+            break
+        }
+    }
+
+func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+        guard connectedPeripheral === peripheral else { return }
+
+        switch characteristic.uuid {
+        case challengeUUID:
+            if let error = error {
+                authenticationFailed("认证写入失败：\(error.localizedDescription)")
+                return
+            }
+
+            switch authState {
+            case .waitingForChallengeWrite:
+                authState = .waitingForModuleResponse
+                statusText = "等待模块认证响应..."
+                scheduleResponseReadFallback()
+            case .waitingForProofWrite:
+                authState = .waitingForAuthenticationStatus
+                statusText = "等待模块确认双向认证..."
+                if let status = statusCharacteristic {
+                    peripheral.readValue(for: status)
+                }
+            default:
+                break
+            }
+
+        case commandUUID:
+            let command = pendingCommand
+            pendingCommand = nil
+            if let error = error {
+                statusText = "\(command?.title ?? "控制")指令写入失败：\(error.localizedDescription)"
+            } else {
+                // ATT 写确认不代表解锁条件已满足，实际结果以 Status 通知为准。
+                statusText = "\(command?.title ?? "控制")指令已发送，等待模块状态"
+            }
+
+        default:
+            break
         }
     }
 }
+
+
