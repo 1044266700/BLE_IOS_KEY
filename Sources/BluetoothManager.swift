@@ -124,40 +124,93 @@ class BluetoothManager: NSObject, ObservableObject {
     }
     
     func unlock() {
-        guard isAuthenticated, let characteristic = commandCharacteristic else {
-            statusText = "请先完成认证"
-            return
-        }
-        
-        // 目前先发送 0xAA 0x55，后续再完善完整报文
-        let packet = Data([0xAA, 0x55])
-        connectedPeripheral?.writeValue(packet, for: characteristic, type: .withResponse)
-        statusText = "已发送解锁指令"
+        sendCommand(.unlock)
     }
-    
-    // MARK: - 内部逻辑
+    func lock() {
+        sendCommand(.lock)
+    }
+    func calibrateAtOneMeter() {
+        sendCommand(.calibrateOneMeter)
+    }
+
     private func connect(to peripheral: CBPeripheral) {
         centralManager.stopScan()
-        isScanning = false
+        clearConnectionState()
+        
         connectedPeripheral = peripheral
         peripheral.delegate = self
         centralManager.connect(peripheral, options: nil)
-        statusText = "正在连接 \(peripheral.name ?? "设备")..."
-    }
+        let timeout = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self = self,
+                  let peripheral = peripheral,
+                  self.connectedPeripheral === peripheral,
+                  peripheral.state == .connecting else { return }
+            self.centralManager.cancelPeripheralConnection(peripheral)
+            self.clearConnectionState()
+            self.statusText = "连接超时，请靠近重试"
+        }
+    connectionTimeout = timeout
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
+}
     
-    private func resetState() {
+    private func clearConnectionState() {
+        connectionTimeout?.cancel()
+        authenticationTimeout?.cancel()
+        responseReadFallback?.cancel()
+        connectionTimeout = nil
+        authenticationTimeout = nil
+        responseReadFallback = nil
         isConnected = false
-        isAuthenticated = false
-        authStep = 0
+        isScanning = false
+        filteredRSSI = nil
+        isUnlocked = false
+        isNearStable = false
+        isApproachArmed = false
+        isCalibrating = false
+
+        authState = .idle
         phoneNonce = nil
+        commandSequence = 0
+        pendingCommand = nil
+        
         challengeCharacteristic = nil
         responseCharacteristic = nil
         commandCharacteristic = nil
         statusCharacteristic = nil
         connectedPeripheral = nil
-        statusText = "已断开"
+        rssiCharacteristic = nil
     }
-    
+
+    // MARK: - 双向认证
+    private func prepareAuthentication() {
+        guard let peripheral = connectedPeripheral,
+              let response = responseCharacteristic,
+              challengeCharacteristic != nil,
+              commandCharacteristic != nil,
+              let rssi = rssiCharacteristic,
+              let status = statusCharacteristic else {
+            authenticationFailed("模块特征不完整，无法认证")
+            return
+        }
+
+        authState = .waitingForResponseNotification
+        isAuthenticated = false
+        statusText = "正在订阅模块通知..."
+
+        peripheral.setNotifyValue(true, for: response)
+        peripheral.setNotifyValue(true, for: status)
+        peripheral.setNotifyValue(true, for: rssi)
+        peripheral.readValue(for: status)
+        peripheral.readValue(for: rssi)
+
+        scheduleAuthenticationTimeout()
+
+        // 已订阅时无需再次等待 CCCD 回调。
+        if response.isNotifying {
+            startAuthentication()
+        }
+    }
+//TODO
     private func startAuthentication() {
         guard let characteristic = challengeCharacteristic else { return }
         
