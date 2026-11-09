@@ -107,14 +107,20 @@ class BluetoothManager: NSObject, ObservableObject {
             }
         }
         
-        centralManager.scanForPeripherals(withServices: [serviceUUID], options: nil)
+        centralManager.scanForPeripherals(
+            withServices: nil,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
     }
     
     func disconnect() {
-        if let p = connectedPeripheral {
-            centralManager.cancelPeripheralConnection(p)
+        let peripheral = connectedPeripheral 
+        clearConnectionState()
+        if let peripheral = peripheral{
+                centralManager.cancelPeripheralConnection(peripheral)
+            }
         }
-        resetState()
+        statusText = "已断开"
     }
     
     func unlock() {
