@@ -88,7 +88,7 @@ class BluetoothManager: NSObject, ObservableObject {
         }
         if let peripheral = connectedPeripheral,
             peripheral.state == .connected || peripheral.state == .connecting{
-                statusText = peripheral.state == .connected ? "设备已连接" ： "正在连接设备..."
+                statusText = peripheral.state == .connected ? "设备已连接" : "正在连接设备..."
                 return
             }
         centralManager.stopScan()
