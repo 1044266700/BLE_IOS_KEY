@@ -2,7 +2,7 @@ name: MyFirstiOSApp
 options:
   bundleIdPrefix: com.example
   deploymentTarget:
-    iOS: "16.6"
+    iOS: "16.0"
   xcodeVersion: "16.0"
 settings:
   base:
