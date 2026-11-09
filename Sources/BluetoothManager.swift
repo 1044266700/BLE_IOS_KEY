@@ -2,6 +2,7 @@ import Foundation
 import CoreBluetooth
 import CommonCrypto
 import Combine
+import Security
 
 class BluetoothManager: NSObject, ObservableObject {
     
@@ -10,19 +11,47 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var isConnected: Bool = false
     @Published var isAuthenticated: Bool = false
     @Published var isScanning: Bool = false
-    
+    @Published var filteredRSSI: Int?
+    @Published var isUnlocked: Bool = false
+    @Published var isNearStable: Bool = false
+    @Published var isApproachArmed: Bool = false
+    @Published var isCalibrating: Bool = false
+
+    private enum AuthenticationState{
+        case idle
+        case waitingForResponseNotification
+        case waitingForChallengeWrite
+        case waitingForModuleResponse
+        case waitingForProofWrite
+        case waitingForAuthenticationStatus
+        case authenticated
+    }
+    private enum KeyCommand: UInt8{
+        case unlock = 0xA1
+        case lock = 0xA2
+        case calibrateOneMeter = 0xB1
+
+        var title: String {
+            switch self {
+                case .unlock: return "解锁"
+                case .lock: return "闭锁"
+                case .calibrateOneMeter: return "一米标定"
+            }
+        }
+    }
     // MARK: - 私有属性
     private var centralManager: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
     
-    private var challengeCharacteristic: CBCharacteristic?   // 00000002  手机写入加密随机数
-    private var responseCharacteristic: CBCharacteristic?    // 00000003  模块返回认证数据
-    private var commandCharacteristic: CBCharacteristic?     // 00000004  发送解锁指令
-    private var statusCharacteristic: CBCharacteristic?      // 00000006  状态（可选）
-    
+    private var challengeCharacteristic: CBCharacteristic?   
+    private var responseCharacteristic: CBCharacteristic?    
+    private var commandCharacteristic: CBCharacteristic?   
+    private var rssiCharacteristic: CBCharacteristic?    
+    private var statusCharacteristic: CBCharacteristic?    
+
+    private let deviceName = "BLE_KEY"
     private let lastPeripheralKey = "LastConnectedPeripheralUUID"
     
-    // ===================== 正式 UUID =====================
     private let serviceUUID     = CBUUID(string: "00000001-12BC-4A5E-9C01-23456789ABCD")
     private let challengeUUID   = CBUUID(string: "00000002-12BC-4A5E-9C01-23456789ABCD")
     private let responseUUID    = CBUUID(string: "00000003-12BC-4A5E-9C01-23456789ABCD")
@@ -31,11 +60,20 @@ class BluetoothManager: NSObject, ObservableObject {
     private let statusUUID      = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
     // =====================================================
     
-    // AES-128 密钥（必须 16 字节），请改成你模块真实的密钥
-    private let aesKey: [UInt8] = Array("0123456789ABCDEF".utf8)
-    
-    private var authStep = 0
+    //蓝牙设备号唯一
+    private let aesKey: [UInt8] = [
+        0x2B, 0x7E, 0x15, 0x16, 0x28, 0xAE, 0xD2, 0xA6,
+        0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F,0x3C
+    ]
+    private var authState: AuthenticationState = .idle
     private var phoneNonce: Data?
+
+    private var commandSequence: UInt32 = 0
+    private var pendingCommand: KeyCommand?
+    
+    private var connectionTimeout: DispatchWorkItem?
+    private var authenticationTimeout: DispatchWorkItem?
+    private var responseReadFallback: DispatchWorkItem?
     
     override init() {
         super.init()
@@ -48,18 +86,22 @@ class BluetoothManager: NSObject, ObservableObject {
             statusText = "请打开蓝牙"
             return
         }
-        
+        if let peripheral = connectedPeripheral,
+            peripheral.state == .connected || peripheral.state == .connecting{
+                statusText = peripheral.state == .connected ? "设备已连接" ： "正在连接设备..."
+                return
+            }
+        centralManager.stopScan()
+        clearConnectionState()
         isScanning = true
-        statusText = "正在扫描..."
-        isAuthenticated = false
-        authStep = 0
+        statusText = "正在扫描 BLE_KEY..."
+
         
-        // 自动重连上次设备
+        // 优先重连上次成功的外设
         if let uuidString = UserDefaults.standard.string(forKey: lastPeripheralKey),
            let uuid = UUID(uuidString: uuidString) {
             let known = centralManager.retrievePeripherals(withIdentifiers: [uuid])
-            if let peripheral = known.first {
-                statusText = "尝试自动重连..."
+            if let peripheral = known.first, peripheral.name == deviceName {
                 connect(to: peripheral)
                 return
             }
