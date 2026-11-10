@@ -120,7 +120,7 @@ class BluetoothManager: NSObject, ObservableObject {
                 centralManager.cancelPeripheralConnection(peripheral)
             }
         }
-        statusText = "已断开"
+        var statusText = "已断开"
     }
     
     func unlock() {
@@ -246,7 +246,7 @@ class BluetoothManager: NSObject, ObservableObject {
             return
         }
         guard let proof = aesECBEncrypt(data: Data(data.suffix(16))),
-            let peripheral == connectedPeripheral,
+            //let peripheral == connectedPeripheral,
             let challenge = challengeCharacteristic else{
             authenticationFailed("生成手机认证应答失败")
             return
