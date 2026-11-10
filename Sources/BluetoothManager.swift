@@ -327,7 +327,7 @@ class BluetoothManager: NSObject, ObservableObject {
 
             self.failConnection("指令确认超时，为安全起见已断开")
         }
-        commandTimeout= timeout
+        commandTimeout = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
     }
 
@@ -584,6 +584,7 @@ extension BluetoothManager: CBPeripheralDelegate {
             authenticationFailed("认证响应通知未开启")
         }
     }
+}
 
 
 func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
