@@ -625,16 +625,16 @@ extension BluetoothManager: CBPeripheralDelegate {
         guard connectedPeripheral === peripheral,
               setupStage == .discoveringServices else { return }
         if let error = error{
-            failConnection ("服务发现失败: \(error.localizedDescription)")
+            failConnection ("服务发现失败：\(error.localizedDescription)")
             return
         }
-        let service = peripheral.services ?? []
-        let discoveredUUIDs = service.map { $0.uuid.uuidString }
+        let services = peripheral.services ?? []
+        let discoveredUUIDs = services.map { $0.uuid.uuidString }
         debugLog("发现 \(services.count)" 个服务：\(discoveredUUIDs.joined(separator:","))")
-        guard let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
-            let detail = sercives.isEmpty
+        guard let service = services.first(where: { $0.uuid == serviceUUID }) else {
+            let detail = services.isEmpty
             ? "服务列表为空"
-            : "实际服务：\((discoveredUUIDs.joined(separator:","))"
+            : "实际服务：\(discoveredUUIDs.joined(separator:","))"
             failConnection ("未找到车钥匙服务:\(detail)")
             return
         }
