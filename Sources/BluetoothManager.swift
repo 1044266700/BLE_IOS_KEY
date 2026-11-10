@@ -67,7 +67,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var statusCharacteristic: CBCharacteristic?    
 
     private let deviceName = "BLE_KEY"
-    private let lastPeripheralKey = "LastConnectedPeripheralUUID"
+    private let lastPeripheralKey = "LastConnectedPeripheralUUID.v2"
     
     private let serviceUUID     = CBUUID(string: "00000001-12BC-4A5E-9C01-23456789ABCD")
     private let challengeUUID   = CBUUID(string: "00000002-12BC-4A5E-9C01-23456789ABCD")
