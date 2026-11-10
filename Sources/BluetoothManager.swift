@@ -218,7 +218,7 @@ class BluetoothManager: NSObject, ObservableObject {
         connectedPeripheral = nil
     }
     private func debugLog(_ message: String){
-        printf("[BLE_KEY] \(message)")
+        print("[BLE_KEY] \(message)")
     }
     private func schedulePhaseTimeout(after seconds: TimeInterval = 10,
                                      message: String,
@@ -228,8 +228,8 @@ class BluetoothManager: NSObject, ObservableObject {
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
                   let peripheral = peripheral,
-                  self.connectionID == seesion,
-                  self.connectedPeripheral == peripheral,
+                  self.connectionID == ssesion,
+                  self.connectedPeripheral === peripheral,
                   self.isConnected else { return }
             self.failConnection(message)
         }
@@ -238,7 +238,7 @@ class BluetoothManager: NSObject, ObservableObject {
     }
     // MARK: - 双向认证
     private func prepareAuthentication() {
-        guard setupStage == discoveringCharacteristics,
+        guard setupStage == .discoveringCharacteristics,
               let challenge = challengeCharacteristic,
               let response = responseCharacteristic,
               let command = commandCharacteristic,
@@ -305,18 +305,18 @@ class BluetoothManager: NSObject, ObservableObject {
 
               switch characteristic.uuid {
               case responseUUID:
-                  guard subscriptionStep = .response else { return }
+                  guard subscriptionStep == .response else { return }
                   beginNotificationSubscription(.status)
               case statusUUID:
-                  guard subscriptionStep = .status else { return }
+                  guard subscriptionStep == .status else { return }
                   beginNotificationSubscription(.rssi)
               case rssiUUID:
-                  guard subscriptionStep = .rssi else { return }
+                  guard subscriptionStep == .rssi else { return }
                   subscriptionStep = .none
                   setupStage = .authenticating
                   startAuthentication()
               default :
-                  return
+                  break
         }
     }
 
@@ -324,7 +324,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private func startAuthentication() {
         guard let peripheral = connectedPeripheral,
               let characteristic = challengeCharacteristic,
-              setupStage = .authenticating
+              setupStage == .authenticating
               authState == .waitingForResponseNotification,
               let nonce = randomBytes(count: 16) else {
             if authState != .authenticated {
@@ -346,8 +346,8 @@ class BluetoothManager: NSObject, ObservableObject {
     }
 
     private func handleModuleResponse(_ data: Data){
-        guard setupStage = .authenticating,
-        guard authState == .waitingForModuleResponse else { return }
+        guard setupStage == .authenticating,
+             authState == .waitingForModuleResponse else { return }
         guard data.count == 32 else{
             authenticationFailed("认证长度错误 ： \(data.count)字节")
             return
@@ -410,7 +410,7 @@ class BluetoothManager: NSObject, ObservableObject {
         let session = connectionID
         let read = DispatchWorkItem { [weak self] in
             guard let self = self,
-                self.connectionID == session
+                self.connectionID == session,
                 self.authState == .waitingForModuleResponse,
                 let peripheral = self.connectedPeripheral,
                 let response = self.responseCharacteristic else { return }
@@ -426,8 +426,8 @@ class BluetoothManager: NSObject, ObservableObject {
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
             let peripheral = peripheral,
-            self.connectionID == session
-            self.connectedPeripheral == peripheral,
+            self.connectionID == session,
+            self.connectedPeripheral === peripheral,
             self.pendingCommandSequence == sequence else { return }
 
             self.failConnection("指令确认超时，为安全起见已断开")
@@ -592,11 +592,11 @@ extension BluetoothManager: CBCentralManagerDelegate {
         connectionTimeout = nil
         isConnected = true
         isScanning = false
-        setupStage = .discoveringSercices
+        setupStage = .discoveringServices
         statusText = "已连接，正在发现服务..."
         debugLog("BLE 已连接，开始发现服务")
-        schedulePhaseTimeout(message: "服务发现超时",peripheral: peripheral)
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
+         schedulePhaseTimeout(message: "服务发现超时",peripheral: peripheral)
         peripheral.discoverServices([serviceUUID])
     }
     
@@ -646,7 +646,7 @@ extension BluetoothManager: CBPeripheralDelegate {
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        guard connectPeripheral === peripheral,
+        guard connectedPeripheral === peripheral,
               service.uuid == serviceUUID,
               setupStage == .discoveringCharacteristics else { return }
         if let error = error {
@@ -656,7 +656,7 @@ extension BluetoothManager: CBPeripheralDelegate {
 
         let characteristics = service.characteristics ?? []
         for characteristic in characteristics {
-            debugLog("服发现特征 \(characteristic.uuid.uuidString)，属性 \(characteristic.properties.rawValue)")
+            debugLog("发现特征 \(characteristic.uuid.uuidString)，属性 \(characteristic.properties.rawValue)")
             switch characteristic.uuid {
             case challengeUUID:
                 challengeCharacteristic = characteristic
@@ -685,7 +685,7 @@ extension BluetoothManager: CBPeripheralDelegate {
               characteristic.uuid == rssiUUID else {return}
         
         if let error = error {
-                failConnection("订阅\(characteristic.uuid.uuidString)失败")
+                failConnection("订阅\(characteristic.uuid.uuidString)失败：\(error.localizedDescription)")
                 return
             }
         
@@ -740,7 +740,7 @@ func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBC
                 authenticationFailed("认证写入失败：\(error.localizedDescription)")
                 return
             }
-            guard setupStage == .authenticated else { return }
+            guard setupStage == .authenticating else { return }
             switch authState {
             case .waitingForChallengeWrite:
                 authState = .waitingForModuleResponse
