@@ -83,7 +83,7 @@ class BluetoothManager: NSObject, ObservableObject {
         0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F,0x3C
     ]
     private var authState: AuthenticationState = .idle
-    private var setupStage: setupStage = .idle
+    private var setupStage: SetupStage = .idle
     private var subscriptionStep: NotificationSubscription = .none
     private var phoneNonce: Data?
     private var connectionID: UInt = 0
