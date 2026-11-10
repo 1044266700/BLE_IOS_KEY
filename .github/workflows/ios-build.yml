@@ -23,11 +23,34 @@ jobs:
       - name: List schemes
         run: xcodebuild -list
 
-      - name: Build
+      - name: Archive (真机 arm64，未签名)
         run: |
-          xcodebuild \
+          set -o pipefail
+          xcodebuild archive \
             -scheme MyFirstiOSApp \
-            -destination "generic/platform=iOS Simulator" \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            build
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath $RUNNER_TEMP/MyFirstiOSApp.xcarchive \
+            ARCHS=arm64 \
+            VALID_ARCHS=arm64 \
+            EXCLUDED_ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH=$(find $RUNNER_TEMP/MyFirstiOSApp.xcarchive/Products -name "*.app" | head -n 1)
+          echo "Found app: $APP_PATH"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r MyFirstiOSApp-unsigned.ipa Payload
+          ls -lh MyFirstiOSApp-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyFirstiOSApp-unsigned-ipa
+          path: MyFirstiOSApp-unsigned.ipa
+          retention-days: 7
