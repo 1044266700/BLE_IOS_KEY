@@ -368,7 +368,8 @@ class BluetoothManager: NSObject, ObservableObject {
 
         ifmoduleAuthenticated && authState != .authenticated {
             completeAuthentication()
-        }else if !moduleAuthenticated && (wasAuthenticated || authState == .authenticated){
+        }
+        else if !moduleAuthenticated && (wasAuthenticated || authState == .authenticated){
             authState = .idle
             pendingCommand = nil
             statusText = "模块认证已失效，请重新连接"
