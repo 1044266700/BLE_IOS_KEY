@@ -597,7 +597,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         debugLog("BLE 已连接，开始发现服务")
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
          schedulePhaseTimeout(message: "服务发现超时",peripheral: peripheral)
-        peripheral.discoverServices([serviceUUID])
+        peripheral.discoverServices(nil)
     }
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, 
@@ -628,8 +628,14 @@ extension BluetoothManager: CBPeripheralDelegate {
             failConnection ("服务发现失败: \(error.localizedDescription)")
             return
         }
+        let service = peripheral.services ?? []
+        let discoveredUUIDs = service.map { $0.uuid.uuidString }
+        debugLog("发现 \(services.count)" 个服务：\(discoveredUUIDs.joined(separator:","))")
         guard let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
-            failConnection ("未找到车钥匙服务")
+            let detail = sercives.isEmpty
+            ? "服务列表为空"
+            : "实际服务：\((discoveredUUIDs.joined(separator:","))"
+            failConnection ("未找到车钥匙服务:\(detail)")
             return
         }
         setupStage = .discoveringCharacteristics
