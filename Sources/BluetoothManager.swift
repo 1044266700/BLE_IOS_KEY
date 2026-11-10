@@ -119,7 +119,6 @@ class BluetoothManager: NSObject, ObservableObject {
         if let peripheral = peripheral{
                 centralManager.cancelPeripheralConnection(peripheral)
             }
-        }
         statusText = "已断开"
     }
     
