@@ -324,7 +324,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private func startAuthentication() {
         guard let peripheral = connectedPeripheral,
               let characteristic = challengeCharacteristic,
-              setupStage == .authenticating
+              setupStage == .authenticating,
               authState == .waitingForResponseNotification,
               let nonce = randomBytes(count: 16) else {
             if authState != .authenticated {
