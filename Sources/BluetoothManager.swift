@@ -630,12 +630,12 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
         let services = peripheral.services ?? []
         let discoveredUUIDs = services.map { $0.uuid.uuidString }
-        debugLog("发现 \(services.count)" 个服务：\(discoveredUUIDs.joined(separator:","))")
+        debugLog("发现 \(services.count) 个服务：\(discoveredUUIDs.joined(separator:","))")
         guard let service = services.first(where: { $0.uuid == serviceUUID }) else {
             let detail = services.isEmpty
             ? "服务列表为空"
             : "实际服务：\(discoveredUUIDs.joined(separator:","))"
-            failConnection ("未找到车钥匙服务:\(detail)")
+            failConnection ("未找到车钥匙服务：\(detail)")
             return
         }
         setupStage = .discoveringCharacteristics
