@@ -67,7 +67,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var statusCharacteristic: CBCharacteristic?    
 
     private let deviceName = "BLE_KEY"
-    private let lastPeripheralKey = "LastConnectedPeripheralUUID.v2"
+    //private let lastPeripheralKey = "LastConnectedPeripheralUUID.v2"
     
     private let serviceUUID     = CBUUID(string: "00000001-12BC-4A5E-9C01-23456789ABCD")
     private let challengeUUID   = CBUUID(string: "00000002-12BC-4A5E-9C01-23456789ABCD")
@@ -120,14 +120,14 @@ class BluetoothManager: NSObject, ObservableObject {
 
         
         // 优先重连上次成功的外设
-        if let uuidString = UserDefaults.standard.string(forKey: lastPeripheralKey),
-           let uuid = UUID(uuidString: uuidString) {
-            let known = centralManager.retrievePeripherals(withIdentifiers: [uuid])
-            if let peripheral = known.first, peripheral.name == deviceName {
-                connect(to: peripheral)
-                return
-            }
-        }
+        // if let uuidString = UserDefaults.standard.string(forKey: lastPeripheralKey),
+        //    let uuid = UUID(uuidString: uuidString) {
+        //     let known = centralManager.retrievePeripherals(withIdentifiers: [uuid])
+        //     if let peripheral = known.first, peripheral.name == deviceName {
+        //         connect(to: peripheral)
+        //         return
+        //     }
+        // }
         
         centralManager.scanForPeripherals(
             withServices: nil,
@@ -595,7 +595,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         setupStage = .discoveringServices
         statusText = "已连接，正在发现服务..."
         debugLog("BLE 已连接，开始发现服务")
-        UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
+        //UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
          schedulePhaseTimeout(message: "服务发现超时",peripheral: peripheral)
         peripheral.discoverServices(nil)
     }
