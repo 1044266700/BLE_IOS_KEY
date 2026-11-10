@@ -35,13 +35,12 @@ struct ContentView: View {
                         .padding(.top, 8)
                 }
                 if bluetooth.isCalibrating {
-                    Label("正在标定，请保持手机在1米处静止3秒，systeImage："ruler"")
+                    Label("正在标定，请保持手机在1米处静止3秒", systemImage: "ruler")
                         .font(.subheadline)
                         .foregroundColor(.orange)
                         .multilineTextAlignment(.center)
-                        .padding(.top, 8)
                 } else if calibrationSessionObserved && bluetooth.isAuthenticated {
-                    Label("标定完成，1米阈值已更新，systeImage："checkmark.circle.fill"")
+                    Label("标定完成，1米阈值已更新", systemImage: "checkmark.circle.fill")
                     .font(.subheadline)
                     .foregroundColor(.green)
                 }
@@ -82,12 +81,11 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(bluetooth.isAuthenticated ? Color.green : Color.gray)
+                    .background(bluetooth.isAuthenticated && !bluetooth.isCalibrating ? Color.orange : Color.gray)
                     .foregroundColor(.white)
                     .cornerRadius(12)
                 }
                 .disabled(!bluetooth.isAuthenticated || bluetooth.isCalibrating)
-            }
                 
                 // 一键解锁按钮
                 Button(action: {
@@ -110,12 +108,12 @@ struct ContentView: View {
                 .foregroundColor(.secondary)
         }
         .padding(24)
-        .onChange(of: blutooth.isCalibrating) { isCalibrating in
+        .onChange(of: bluetooth.isCalibrating) { isCalibrating in
             if isCalibrating{
                 calibrationSessionObserved = true
             }
         }
-        .onChange(of: blutooth.isConnected) { isConnected in
+        .onChange(of: bluetooth.isConnected) { isConnected in
             if !isConnected{
                 calibrationSessionObserved = false
             }
