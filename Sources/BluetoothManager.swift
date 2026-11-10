@@ -75,8 +75,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var connectionTimeout: DispatchWorkItem?
     private var authenticationTimeout: DispatchWorkItem?
     private var responseReadFallback: DispatchWorkItem?
-    private var cammandTimeout: DispatchWorkItem?
-    
+    private var commandTimeout: DispatchWorkItem?
     override init() {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: nil)
