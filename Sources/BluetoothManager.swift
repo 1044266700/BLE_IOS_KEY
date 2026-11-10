@@ -228,7 +228,7 @@ class BluetoothManager: NSObject, ObservableObject {
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
                   let peripheral = peripheral,
-                  self.connectionID == ssesion,
+                  self.connectionID == session,
                   self.connectedPeripheral === peripheral,
                   self.isConnected else { return }
             self.failConnection(message)
