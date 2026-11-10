@@ -417,7 +417,7 @@ class BluetoothManager: NSObject, ObservableObject {
         
         return Data(outBytes)
     }
-
+}
 // MARK: - CBCentralManagerDelegate
 extension BluetoothManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
