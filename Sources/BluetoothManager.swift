@@ -120,7 +120,7 @@ class BluetoothManager: NSObject, ObservableObject {
                 centralManager.cancelPeripheralConnection(peripheral)
             }
         }
-        var statusText = "已断开"
+        statusText = "已断开"
     }
     
     func unlock() {
