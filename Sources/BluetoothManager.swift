@@ -26,6 +26,23 @@ class BluetoothManager: NSObject, ObservableObject {
         case waitingForAuthenticationStatus
         case authenticated
     }
+    
+    private enum SetupStage {
+        case idle
+        case discoveringServices
+        case discoveringCharacteristics
+        case subscribingNotifications
+        case authenticating
+        case ready
+    }
+
+    private enum NotificationSubscription {
+        case none
+        case response
+        case status
+        case rssi
+    }
+    
     private enum KeyCommand: UInt8{
         case unlock = 0xA1
         case lock = 0xA2
@@ -66,16 +83,20 @@ class BluetoothManager: NSObject, ObservableObject {
         0xAB, 0xF7, 0x15, 0x88, 0x09, 0xCF, 0x4F,0x3C
     ]
     private var authState: AuthenticationState = .idle
+    private var setupStage: setupStage = .idle
+    private var subscriptionStep: NotificationSubscription = .none
     private var phoneNonce: Data?
+    private var connectionID: UInt = 0
 
     private var commandSequence: UInt32 = 0
     private var pendingCommand: KeyCommand?
     private var pendingCommandSequence: UInt32?
     
     private var connectionTimeout: DispatchWorkItem?
-    private var authenticationTimeout: DispatchWorkItem?
+    private var phaseTimeout: DispatchWorkItem?
     private var responseReadFallback: DispatchWorkItem?
     private var commandTimeout: DispatchWorkItem?
+    
     override init() {
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: nil)
@@ -135,21 +156,23 @@ class BluetoothManager: NSObject, ObservableObject {
         connectedPeripheral = peripheral
         peripheral.delegate = self
         statusText = "正在连接 \(deviceName)..."
+        debugLog("开始连接 \(peripheral.identifier.uuidString)")
         centralManager.connect(peripheral, options: nil)
+        let session = connectionID
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
-                  let peripheral = peripheral,
-                  self.connectedPeripheral === peripheral,
-                  peripheral.state == .connecting else { return }
-            self.centralManager.cancelPeripheralConnection(peripheral)
-            self.clearConnectionState()
-            self.statusText = "连接超时，请靠近重试"
+            let peripheral = peripheral,
+            self.connectionID == session,
+            self.connectedPeripheral === peripheral,
+            peripheral.state == .connecting else { return }
+            self.failConnection("连接超时，请靠近重试")
         }
     connectionTimeout = timeout
     DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
 }
     private func failConnection(_ message: String) {
         let peripheral = connectedPeripheral
+        debugLog(message)
         centralManager.stopScan()
         clearConnectionState()
         if let peripheral = peripheral {
@@ -159,12 +182,13 @@ class BluetoothManager: NSObject, ObservableObject {
     }
 
     private func clearConnectionState() {
+        connectionID &+= 1
         connectionTimeout?.cancel()
-        authenticationTimeout?.cancel()
+        phaseTimeout?.cancel()
         responseReadFallback?.cancel()
         commandTimeout?.cancel()
         connectionTimeout = nil
-        authenticationTimeout = nil
+        phaseTimeout = nil
         responseReadFallback = nil
         commandTimeout = nil
         
@@ -178,6 +202,8 @@ class BluetoothManager: NSObject, ObservableObject {
         isCalibrating = false
 
         authState = .idle
+        setupStage = .idle
+        subscriptionStep = .none
         phoneNonce = nil
         commandSequence = 0
         pendingCommand = nil
@@ -191,50 +217,115 @@ class BluetoothManager: NSObject, ObservableObject {
         connectedPeripheral?.delegate = nil
         connectedPeripheral = nil
     }
-
+    private func debugLog(_ message: String){
+        printf("[BLE_KEY] \(message)")
+    }
+    private func schedulePhaseTimeout(after seconds: TimeInterval = 10,
+                                     message: String,
+                                     peripheral: CBPeripheral){
+        phaseTimeout?.cancel()
+        let session = connectionID
+        let timeout = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self = self,
+                  let peripheral = peripheral,
+                  self.connectionID == seesion,
+                  self.connectedPeripheral == peripheral,
+                  self.isConnected else { return }
+            self.failConnection(message)
+        }
+         phaseTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: timeout)
+    }
     // MARK: - 双向认证
     private func prepareAuthentication() {
-        guard let peripheral = connectedPeripheral,
+        guard setupStage == discoveringCharacteristics,
               let challenge = challengeCharacteristic,
               let response = responseCharacteristic,
               let command = commandCharacteristic,
               let rssi = rssiCharacteristic,
               let status = statusCharacteristic, 
               challenge.properties.contains(.write),
-        challenge.properties.contains(.write),
-        response.properties.contains(.read),
-        response.properties.contains(.notify),
-        command.properties.contains(.write),
-        rssi.properties.contains(.read),
-        rssi.properties.contains(.notify),
-        status.properties.contains(.read),
-        status.properties.contains(.notify) else {
+              response.properties.contains(.read),
+              response.properties.contains(.notify),
+              command.properties.contains(.write),
+              rssi.properties.contains(.read),
+              rssi.properties.contains(.notify),
+              status.properties.contains(.read),
+              status.properties.contains(.notify) else {
             authenticationFailed("模块特征不完整，无法认证")
             return
         }
-
+        
+        setupStage = .subscribingNotifications
         authState = .waitingForResponseNotification
         isAuthenticated = false
-        statusText = "正在订阅模块通知..."
+        beginNotificationSubscription(.response)
+    }
+    private func beginNotificationSubscription(_ step: NotificationSubscription) {
+        guard let peripheral = connectedPeripheral,
+              setupStage == .subscribingNotifications else { return }
 
-        peripheral.setNotifyValue(true, for: response)
-        peripheral.setNotifyValue(true, for: status)
-        peripheral.setNotifyValue(true, for: rssi)
-        peripheral.readValue(for: status)
-        peripheral.readValue(for: rssi)
+        let characteristic: CBCharacteristic
+        let title: String
+        switch step {
+            case .response:
+                guard let response = responseCharacteristic else { return }
+                characteristic = response
+                title = "认证响应 （1/3）"
+            case .status:
+                guard let status = statusCharacteristic else { return }
+                characteristic = status
+                title = "模块状态 （2/3）"
+            case .rssi:
+                guard let rssi = rssiCharacteristic else { return }
+                characteristic = rssi
+                title = "rssi （3/3）"
+            case .none:
+                return
+        }
+        subscriptionStep = step
+        statusText = "正在订阅\(title)通知..."
+        debugLog("订阅 \(characteristic.uuid.uuidString)")
+        schedulePhaseTimeout(after:8,
+                            message: "订阅\(title)通知超时",
+                            peripheral: peripheral)
 
-        scheduleAuthenticationTimeout()
-
-        // 已订阅时无需再次等待 CCCD 回调。
-        if response.isNotifying {
-            startAuthentication()
+        if characteristic.isNotifying {
+            notificationSubscriptionCompleted(characteristic, for: peripheral)
+        } else {
+            peripheral.setNotifyValue(true, for: characteristic)
         }
     }
+
+    private func notificationSubscriptionCompleted(_ characteristic: CBCharacteristic,
+                                                  for peripheral: CBPeripheral){
+        guard connectedPeripheral === peripheral,
+              setupStage == .subscribingNotifications else { return }
+              debugLog("已订阅 \(characteristic.uuid.uuidString)")
+
+              switch characteristic.uuid {
+              case responseUUID:
+                  guard subscriptionStep = .response else { return }
+                  beginNotificationSubscription(.status)
+              case statusUUID:
+                  guard subscriptionStep = .status else { return }
+                  beginNotificationSubscription(.rssi)
+              case rssiUUID:
+                  guard subscriptionStep = .rssi else { return }
+                  subscriptionStep = .none
+                  setupStage = .authenticating
+                  startAuthentication()
+              default :
+                  return
+        }
+    }
+
 //TODO
     private func startAuthentication() {
         guard let peripheral = connectedPeripheral,
               let characteristic = challengeCharacteristic,
-              authState == .waitingForResponseNotification || authState == .idle,
+              setupStage = .authenticating
+              authState == .waitingForResponseNotification,
               let nonce = randomBytes(count: 16) else {
             if authState != .authenticated {
                 authenticationFailed("无法开始认证")
@@ -245,13 +336,17 @@ class BluetoothManager: NSObject, ObservableObject {
         phoneNonce = Data(nonce)
         authState = .waitingForChallengeWrite
         isAuthenticated = false
-        statusText = "正在进行双向认证..."
-
+        statusText = "通知订阅完成，正在发送Challenge..."
+        debugLog("发送16字节Challenge")
+        schedulePhaseTimeout(after:8,
+                    message: "认证超时：challenge写入未确认",
+                    peripheral: peripheral)
         // 第一步必须写原始 phone_nonce，由模块计算 AES(phone_nonce)。
         peripheral.writeValue(Data(nonce), for: characteristic, type: .withResponse)
     }
 
     private func handleModuleResponse(_ data: Data){
+        guard setupStage = .authenticating,
         guard authState == .waitingForModuleResponse else { return }
         guard data.count == 32 else{
             authenticationFailed("认证长度错误 ： \(data.count)字节")
@@ -274,43 +369,52 @@ class BluetoothManager: NSObject, ObservableObject {
         phoneNonce = nil
         authState = .waitingForProofWrite
         statusText = "模块已验证，正在验证手机..."
+        debugLog("模块响应校验通过，发送proof")
+        schedulePhaseTimeout(after:8,
+                    message: "认证超时：proof写入未确认",
+                    peripheral: peripheral)
 
         // 第二步返回 AES(module_nonce)，此时还不能宣告双向认证成功。
         peripheral.writeValue(proof, for: challenge, type: .withResponse)
     }
     private func completeAuthentication(){
-        authenticationTimeout?.cancel()
+        phaseTimeout?.cancel()
         responseReadFallback?.cancel()
-        authenticationTimeout = nil
+        phaseTimeout = nil
         responseReadFallback = nil
         phoneNonce = nil
         commandSequence = 0
+        setupStage = .ready
         authState = .authenticated
         isAuthenticated = true
         statusText = "双向认证完成"
+        debugLog("双向认证完成")
     }   
     private func authenticationFailed(_ message: String){
         // 认证失败后模块可能还在等待proof
         failConnection(message)
     }
-    private func scheduleAuthenticationTimeout(){
-        authenticationTimeout?.cancel()
-        let timeout = DispatchWorkItem { [weak self] in
-            guard let self = self,
-                self.isConnected,
-                self.authState != .authenticated else { return }
-                self.authenticationFailed("认证超时，请断开后重新连接")
-            }
-        authenticationTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
-    }
+    // private func scheduleAuthenticationTimeout(){
+    //     authenticationTimeout?.cancel()
+    //     let timeout = DispatchWorkItem { [weak self] in
+    //         guard let self = self,
+    //             self.isConnected,
+    //             self.authState != .authenticated else { return }
+    //             self.authenticationFailed("认证超时，请断开后重新连接")
+    //         }
+    //     authenticationTimeout = timeout
+    //     DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    // }
     private func scheduleResponseReadFallback(){
         responseReadFallback?.cancel()
+        let session = connectionID
         let read = DispatchWorkItem { [weak self] in
             guard let self = self,
+                self.connectionID == session
                 self.authState == .waitingForModuleResponse,
                 let peripheral = self.connectedPeripheral,
                 let response = self.responseCharacteristic else { return }
+                self.debugLog("认证响应通知未到达，回退读取 Response")
                 peripheral.readValue(for:response)                     
             }
         responseReadFallback  = read
@@ -318,9 +422,11 @@ class BluetoothManager: NSObject, ObservableObject {
     }
     private func scheduleCommandTimeout(for sequence: UInt32, peripheral: CBPeripheral) {
         commandTimeout?.cancel()
+        let session = connectionID
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
             let peripheral = peripheral,
+            self.connectionID == session
             self.connectedPeripheral == peripheral,
             self.pendingCommandSequence == sequence else { return }
 
@@ -486,7 +592,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
         connectionTimeout = nil
         isConnected = true
         isScanning = false
+        setupStage = .discoveringSercices
         statusText = "已连接，正在发现服务..."
+        debugLog("BLE 已连接，开始发现服务")
+        schedulePhaseTimeout(message: "服务发现超时",peripheral: peripheral)
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
         peripheral.discoverServices([serviceUUID])
     }
@@ -494,26 +603,27 @@ extension BluetoothManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, 
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
+        let message = "连接失败: \(error?.localizedDescription ?? "未知错误")"
+        debugLog(message)
         clearConnectionState()
-        statusText = "连接失败: \(error?.localizedDescription ?? "未知错误")"
+        statusText = message
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, 
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
+        let message = error.map{ "连接断开: \($0.localizedDescription)"} ?? "连接已断开"
+        debugLog(message)
         clearConnectionState()
-        if let error = error {
-           // statusText = "连接断开: \(error?.localizedDescription)"
-        } else {
-            statusText = "连接已断开"
-        }
+        statusText = message
     }
 }
 
 // MARK: - CBPeripheralDelegate
 extension BluetoothManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
-        guard connectedPeripheral === peripheral else { return }
+        guard connectedPeripheral === peripheral,
+              setupStage == .discoveringServices else { return }
         if let error = error{
             failConnection ("服务发现失败: \(error.localizedDescription)")
             return
@@ -522,7 +632,10 @@ extension BluetoothManager: CBPeripheralDelegate {
             failConnection ("未找到车钥匙服务")
             return
         }
-
+        setupStage = .discoveringCharacteristics
+        statusText = "已找到车钥匙服务，正在发现特征..."
+        debugLog("服务发现成功，开始发现特征")
+        schedulePhaseTimeout(message: "特征发现超时",peripheral: peripheral)
         peripheral.discoverCharacteristics([
             challengeUUID,
             responseUUID,
@@ -533,13 +646,17 @@ extension BluetoothManager: CBPeripheralDelegate {
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        guard connectedPeripheral === peripheral, service.uuid == serviceUUID else { return }
+        guard connectPeripheral === peripheral,
+              service.uuid == serviceUUID,
+              setupStage == .discoveringCharacteristics else { return }
         if let error = error {
             failConnection ("特征发现失败：\(error.localizedDescription)")
             return
         }
 
-        for characteristic in service.characteristics ?? [] {
+        let characteristics = service.characteristics ?? []
+        for characteristic in characteristics {
+            debugLog("服发现特征 \(characteristic.uuid.uuidString)，属性 \(characteristic.properties.rawValue)")
             switch characteristic.uuid {
             case challengeUUID:
                 challengeCharacteristic = characteristic
@@ -556,35 +673,29 @@ extension BluetoothManager: CBPeripheralDelegate {
             }
         }
 
+        statusText = "特征发现完成，正在校验模块能力"
         prepareAuthentication()
     }
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard connectedPeripheral === peripheral else { return }
+        guard characteristic.uuid == responseUUID ||
+              characteristic.uuid == statusUUID ||
+              characteristic.uuid == rssiUUID else {return}
+        
         if let error = error {
-            if characteristic.uuid == responseUUID {
-                failConnection("订阅模块通知失败：\(error.localizedDescription)")
+                failConnection("订阅\(characteristic.uuid.uuidString)失败")
                 return
             }
-            if characteristic.uuid == statusUUID || characteristic.uuid == rssiUUID {
-                if !characteristic.isNotifying{
-                    failConnection("模块状态或 RSSI 通知未开启")
-                }
-                return
-            }
+        
 
-        guard characteristic.uuid == responseUUID else { return }
-        if characteristic.isNotifying {
-            if authState == .waitingForResponseNotification {
-                startAuthentication()
-            }
-        } else if authState != .authenticated {
-            authenticationFailed("认证响应通知未开启")
+        guard characteristic.isNotifying else { 
+                failConnection("通知模块未开启：\(characteristic.uuid.uuidString)")
+                return      
         }
+        notificationSubscriptionCompleted(characteristic, for: peripheral)
     }
-}
-
 
 func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
@@ -629,18 +740,28 @@ func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBC
                 authenticationFailed("认证写入失败：\(error.localizedDescription)")
                 return
             }
-
+            guard setupStage == .authenticated else { return }
             switch authState {
             case .waitingForChallengeWrite:
                 authState = .waitingForModuleResponse
-                statusText = "等待模块认证响应..."
+                statusText = "Challeng 写入成功，等待模块响应..."
+                debugLog("Challeng 写入成功，等待32字节模块响应")
+                schedulePhaseTimeout(after:8,
+                                    message: "认证超时：未收到模块响应",
+                                    peripheral: peripheral)
                 scheduleResponseReadFallback()
             case .waitingForProofWrite:
                 authState = .waitingForAuthenticationStatus
-                statusText = "等待模块确认双向认证..."
-                if let status = statusCharacteristic {
-                    peripheral.readValue(for: status)
+                statusText = "proof写入成功，等待模块认证状态..."
+                debugLog("proof写入成功，等待模块认证状态")
+                schedulePhaseTimeout(after:8,
+                                    message: "认证超时：未收到模块认证响应",
+                                    peripheral: peripheral)
+                guard let status = statusCharacteristic else{
+                    authenticationFailed("模块状态特征不可用")
+                    return
                 }
+                peripheral.readValue(for: status)
             default:
                 break
             }
