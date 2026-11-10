@@ -366,7 +366,7 @@ class BluetoothManager: NSObject, ObservableObject {
         isApproachArmed = status & (1 << 3) != 0
         isCalibrating = status & (1 << 4) != 0
 
-        ifmoduleAuthenticated && authState != .authenticated {
+        if moduleAuthenticated && authState != .authenticated {
             completeAuthentication()
         }
         else if !moduleAuthenticated && (wasAuthenticated || authState == .authenticated){
