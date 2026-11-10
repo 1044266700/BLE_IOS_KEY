@@ -245,8 +245,8 @@ class BluetoothManager: NSObject, ObservableObject {
             return
         }
         guard let proof = aesECBEncrypt(data: Data(data.suffix(16))),
-            //let peripheral == connectedPeripheral,
-            let challenge = challengeCharacteristic else{
+              let peripheral = connectedPeripheral,          // 正确解包
+              let challenge = challengeCharacteristic else {
             authenticationFailed("生成手机认证应答失败")
             return
         }
@@ -313,7 +313,7 @@ class BluetoothManager: NSObject, ObservableObject {
             statusText = "请先完成双向认证"
             return
         }
-        guard pendingCommand = nil else{
+        guard pendingCommand == nil else{
             statusText = "上一条指令尚未确认，请稍后"
             return
         }
@@ -471,7 +471,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         guard connectedPeripheral === peripheral else { return }
         clearConnectionState()
         if let error = error {
-            statusText = "连接断开: \(error?.localizedDescription)"
+           // statusText = "连接断开: \(error?.localizedDescription)"
         } else {
             statusText = "连接已断开"
         }
