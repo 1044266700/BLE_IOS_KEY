@@ -77,8 +77,8 @@ class BluetoothManager: NSObject, ObservableObject {
     private let commandUUID         = CBUUID(string: "00000004-12BC-4A5E-9C01-23456789ABCD")
     private let rssiUUID            = CBUUID(string: "00000005-12BC-4A5E-9C01-23456789ABCD")
     private let statusUUID          = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
-    private let batteryServiceUUID  = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
-    private let batteryLevelUUID    = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
+    private let batteryServiceUUID  = CBUUID(string: "180F")
+    private let batteryLevelUUID    = CBUUID(string: "2A19")
     // =====================================================
     
     //蓝牙设备号唯一
@@ -200,7 +200,7 @@ class BluetoothManager: NSObject, ObservableObject {
         isScanning = false
         isAuthenticated = false
         filteredRSSI = nil
-        batteryLeve = nil
+        batteryLevel = nil
         isUnlocked = false
         isNearStable = false
         isApproachArmed = false
@@ -670,7 +670,7 @@ extension BluetoothManager: CBPeripheralDelegate {
                 debugLog("电量特征发现失败: \(error.localizedDescription)")
                 return 
             }
-            guard let battery = service.characteristics?first(where: {
+            guard let battery = service.characteristics?.first(where: {
                 $0.uuid == batteryLevelUUID
             })else{
                 debugLog("未找到标准电量特征 2A19")
@@ -721,11 +721,11 @@ extension BluetoothManager: CBPeripheralDelegate {
                     error: Error?) {
         guard connectedPeripheral === peripheral else { return }
 
-        if characteristic.uuid == batteryServiceUUID {
+        if characteristic.uuid == batteryLevelUUID {
             if let error = error {
-                debugLog("订阅电量通知失败: \(error.localizedDescription)")
+                debugLog("订阅电量通知失败：\(error.localizedDescription)")
             } else {
-                 debugLog("电量通知状态: \(characteristic.isNotifying ? "已开启" : "已关闭")")
+                 debugLog("电量通知状态：\(characteristic.isNotifying ? "已开启" : "已关闭")")
             }
             return
         }
@@ -761,7 +761,7 @@ func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CB
                     authenticationFailed("读取认证状态失败：\(error.localizedDescription)")
                 }
             case batteryLevelUUID:
-                debugLog("读取电量失败: \(error.localizedDescription)")
+                debugLog("读取电量失败：\(error.localizedDescription)")
             default:
                 break
             }
@@ -778,7 +778,7 @@ func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CB
         case statusUUID:
             handleStatus(data)
         case batteryLevelUUID:
-            guard data.count == 1 data[0] <= 100 else { 
+            guard data.count == 1, data[0] <= 100 else { 
                 debugLog("电量数据长度或数值无效")      
                 return
             }
