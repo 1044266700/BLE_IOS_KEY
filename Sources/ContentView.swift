@@ -26,6 +26,10 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
+
+                Text(bluetooth.autoConnectEnabled ? "后台自动连接：开启" : "后台自动连接：已暂停")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                 
                 if let batteryLevel = bluetooth.batteryLevel {
                     VStack(spacing: 6) {
@@ -67,16 +71,17 @@ struct ContentView: View {
             // 按钮区域
             VStack(spacing: 16) {
                 Button(action: {
-                    if bluetooth.isConnected {
+                    if bluetooth.isConnected || bluetooth.autoConnectEnabled {
                         bluetooth.disconnect()
                     } else {
                         bluetooth.startScan()
                     }
                 }) {
-                    Text(bluetooth.isConnected ? "断开连接" : "扫描并连接")
+                    Text(bluetooth.isConnected ? "断开并暂停自动连接" : 
+                            (bluetooth.autoConnectEnabled ? "暂停自动连接" : "开启自动连接"))
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .background(bluetooth.isConnected ? Color.red : Color.blue)
+                        .background(bluetooth.autoConnectEnabled ? Color.red : Color.blue)
                         .foregroundColor(.white)
                         .cornerRadius(12)
                 }
