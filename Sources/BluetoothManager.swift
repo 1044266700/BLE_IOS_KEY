@@ -657,7 +657,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         ], for: service)
 
         //电量服务独立发现，不参与车钥匙认证状态机
-        if let batteryService = service.first(where: { $0.uuid == batteryServiceUUID }){
+        if let batteryService = services.first(where: { $0.uuid == batteryServiceUUID }){
             peripheral.discoverCharacteristics([batteryLevelUUID], for: batteryService)
         }
     }
