@@ -105,10 +105,23 @@ class BluetoothManager: NSObject, ObservableObject {
     
     override init() {
         super.init()
+        
+        var options: [String: Any] = [:]
+        let backgroundModes = Bundle.main.object(
+            forInfoDictionaryKey: "UIBackgroundModes"
+        ) as? [String] ?? []
+
+        if backgroundModes.contains("bluetooth-central") {
+            options[CBCentralManagerOptionRestoreIdentifierKey] = centralRestoreIdentifier
+        } else {
+            // 未声明后台模式时启用状态恢复会让 CoreBluetooth 在启动时异常终止。
+            print("[BLE_KEY] 安装包未声明 bluetooth-central，已禁用 Central 状态恢复")
+        }
+        
         centralManager = CBCentralManager(
             delegate: self, 
             queue: nil,
-            options: [CBCentralManagerOptionRestoreIdentifierKey: centralRestoreIdentifier]
+            options: options.isEmpty ? nil : options
         )
     }
     
