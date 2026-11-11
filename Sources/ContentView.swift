@@ -30,6 +30,10 @@ struct ContentView: View {
                 Text(bluetooth.autoConnectEnabled ? "后台自动连接：开启" : "后台自动连接：已暂停")
                     .font(.caption)
                     .foregroundColor(.secondary)
+
+                Text(bluetooth.backgroundBluetoothEnabled ? "蓝牙后台模式：已启用" : "后台自动连接：未启用")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
                 
                 if let batteryLevel = bluetooth.batteryLevel {
                     VStack(spacing: 6) {
