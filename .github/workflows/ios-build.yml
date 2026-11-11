@@ -48,8 +48,8 @@ jobs:
             /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes array" "$PLIST"
             /usr/libexec/PlistBuddy -c "Add :UIBackgroundModes:0 string bluetooth-central" "$PLIST"
           fi
-          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP_PATH/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:0" "$APP_PATH/Info.plist")" = "bluetooth-central"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PLIST"
+          test "$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:0" "$PLIST")" = "bluetooth-central"
 
       - name: Package unsigned IPA
         run: |
