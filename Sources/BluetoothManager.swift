@@ -12,6 +12,7 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var isAuthenticated: Bool = false
     @Published var isScanning: Bool = false
     @Published var filteredRSSI: Int?
+    @Published var batteryLevel: Int?
     @Published var isUnlocked: Bool = false
     @Published var isNearStable: Bool = false
     @Published var isApproachArmed: Bool = false
@@ -65,16 +66,19 @@ class BluetoothManager: NSObject, ObservableObject {
     private var commandCharacteristic: CBCharacteristic?   
     private var rssiCharacteristic: CBCharacteristic?    
     private var statusCharacteristic: CBCharacteristic?    
+    private var batteryCharacteristic: CBCharacteristic?    
 
     private let deviceName = "BLE_KEY"
     //private let lastPeripheralKey = "LastConnectedPeripheralUUID.v2"
     
-    private let serviceUUID     = CBUUID(string: "00000001-12BC-4A5E-9C01-23456789ABCD")
-    private let challengeUUID   = CBUUID(string: "00000002-12BC-4A5E-9C01-23456789ABCD")
-    private let responseUUID    = CBUUID(string: "00000003-12BC-4A5E-9C01-23456789ABCD")
-    private let commandUUID     = CBUUID(string: "00000004-12BC-4A5E-9C01-23456789ABCD")
-    private let rssiUUID        = CBUUID(string: "00000005-12BC-4A5E-9C01-23456789ABCD")
-    private let statusUUID      = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
+    private let serviceUUID         = CBUUID(string: "00000001-12BC-4A5E-9C01-23456789ABCD")
+    private let challengeUUID       = CBUUID(string: "00000002-12BC-4A5E-9C01-23456789ABCD")
+    private let responseUUID        = CBUUID(string: "00000003-12BC-4A5E-9C01-23456789ABCD")
+    private let commandUUID         = CBUUID(string: "00000004-12BC-4A5E-9C01-23456789ABCD")
+    private let rssiUUID            = CBUUID(string: "00000005-12BC-4A5E-9C01-23456789ABCD")
+    private let statusUUID          = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
+    private let batteryServiceUUID  = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
+    private let batteryLevelUUID    = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
     // =====================================================
     
     //蓝牙设备号唯一
@@ -196,6 +200,7 @@ class BluetoothManager: NSObject, ObservableObject {
         isScanning = false
         isAuthenticated = false
         filteredRSSI = nil
+        batteryLeve = nil
         isUnlocked = false
         isNearStable = false
         isApproachArmed = false
@@ -214,6 +219,7 @@ class BluetoothManager: NSObject, ObservableObject {
         commandCharacteristic = nil
         rssiCharacteristic = nil
         statusCharacteristic = nil
+        batteryCharacteristic = nil
         connectedPeripheral?.delegate = nil
         connectedPeripheral = nil
     }
@@ -649,11 +655,39 @@ extension BluetoothManager: CBPeripheralDelegate {
             rssiUUID,
             statusUUID
         ], for: service)
+
+        //电量服务独立发现，不参与车钥匙认证状态机
+        if let batteryService = service.first(where: { $0.uuid == batteryServiceUUID }){
+            peripheral.discoverCharacteristics([batteryLevelUUID], for: batteryService)
+        }
     }
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
-        guard connectedPeripheral === peripheral,
-              service.uuid == serviceUUID,
+        guard connectedPeripheral === peripheral else { return }
+
+        if service.uuid == batteryServiceUUID {
+            if let error = error {
+                debugLog("电量特征发现失败: \(error.localizedDescription)")
+                return 
+            }
+            guard let battery = service.characteristics?first(where: {
+                $0.uuid == batteryLevelUUID
+            })else{
+                debugLog("未找到标准电量特征 2A19")
+                return 
+            }
+
+            batteryCharacteristic = battery
+            debugLog("发现标准电量特征，读取并订阅 Notify")
+            if battery.properties.contains(.read) {
+                peripheral.readValue(for: battery)
+            }
+            if battery.properties.contains(.notify) {
+                peripheral.setNotifyValue(true, for: battery)
+            }
+            return
+        }
+        guard service.uuid == serviceUUID,
               setupStage == .discoveringCharacteristics else { return }
         if let error = error {
             failConnection ("特征发现失败：\(error.localizedDescription)")
@@ -686,6 +720,16 @@ extension BluetoothManager: CBPeripheralDelegate {
                     didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
         guard connectedPeripheral === peripheral else { return }
+
+        if characteristic.uuid == batteryServiceUUID {
+            if let error = error {
+                debugLog("订阅电量通知失败: \(error.localizedDescription)")
+            } else {
+                 debugLog("电量通知状态: \(characteristic.isNotifying ? "已开启" : "已关闭")")
+            }
+            return
+        }
+        
         guard characteristic.uuid == responseUUID ||
               characteristic.uuid == statusUUID ||
               characteristic.uuid == rssiUUID else {return}
@@ -716,6 +760,8 @@ func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CB
                 if authState == .waitingForAuthenticationStatus {
                     authenticationFailed("读取认证状态失败：\(error.localizedDescription)")
                 }
+            case batteryLevelUUID:
+                debugLog("读取电量失败: \(error.localizedDescription)")
             default:
                 break
             }
@@ -731,6 +777,13 @@ func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CB
             filteredRSSI = Int(Int8(bitPattern: data[0]))
         case statusUUID:
             handleStatus(data)
+        case batteryLevelUUID:
+            guard data.count == 1 data[0] <= 100 else { 
+                debugLog("电量数据长度或数值无效")      
+                return
+            }
+            batteryLevel = Int(data[0])
+            debugLog("电池电量：\(data[0])%")      
         default:
             break
         }
