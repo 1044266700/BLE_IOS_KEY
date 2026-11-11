@@ -28,7 +28,7 @@ struct ContentView: View {
                     .padding(.horizontal)
                 
                 if let batteryLevel = bluetooth.batteryLevel {
-                    Vstack(spacing: 6){
+                    VStack(spacing: 6) {
                         HStack{
                             Label("电池电量", systemImage: "battery.100")
                             Spacer()
