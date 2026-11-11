@@ -27,6 +27,20 @@ struct ContentView: View {
                     .multilineTextAlignment(.center)
                     .padding(.horizontal)
                 
+                if let batteryLevel = bluetooth.batteryLevel {
+                    Vstack(spacing: 6){
+                        HStack{
+                            Label("电池电量", systemImage: "battery.100")
+                            Spacer()
+                            Text("\(batteryLevel)%")
+                                .fontWeight(.semibold)
+                        }
+                        ProgressView(value: Double(batteryLevel), total: 100)
+                            .tint(.green)
+                    }
+                    .padding(.top, 4)
+                }
+                
                 if bluetooth.isAuthenticated {
                     Text("认证完成")
                         .font(.title2)
