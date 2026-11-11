@@ -11,6 +11,7 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var isConnected: Bool = false
     @Published var isAuthenticated: Bool = false
     @Published var isScanning: Bool = false
+    @Published private(set) var  autoConnectEnabled: Bool = true
     @Published var filteredRSSI: Int?
     @Published var batteryLevel: Int?
     @Published var isUnlocked: Bool = false
@@ -69,6 +70,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var batteryCharacteristic: CBCharacteristic?    
 
     private let deviceName = "BLE_KEY"
+    private let centralRestoreIdentifier = "com.example.MyFirstiOSApp.BLEKeyCentral"
     //private let lastPeripheralKey = "LastConnectedPeripheralUUID.v2"
     
     private let serviceUUID         = CBUUID(string: "00000001-12BC-4A5E-9C01-23456789ABCD")
@@ -103,11 +105,16 @@ class BluetoothManager: NSObject, ObservableObject {
     
     override init() {
         super.init()
-        centralManager = CBCentralManager(delegate: self, queue: nil)
+        centralManager = CBCentralManager(
+            delegate: self, 
+            queue: nil,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: centralRestoreIdentifier]
+        )
     }
     
     // MARK: - 对外方法
     func startScan() {
+        autoConnectEnabled = true
         guard centralManager.state == .poweredOn else {
             statusText = "请打开蓝牙"
             return
@@ -120,7 +127,8 @@ class BluetoothManager: NSObject, ObservableObject {
         centralManager.stopScan()
         clearConnectionState()
         isScanning = true
-        statusText = "正在扫描 BLE_KEY..."
+        statusText = "正在自动搜索 BLE_KEY..."
+        debugLog("按车钥匙服务 UUID 启动扫描，允许后台自动连接")
 
         
         // 优先重连上次成功的外设
@@ -134,13 +142,15 @@ class BluetoothManager: NSObject, ObservableObject {
         // }
         
         centralManager.scanForPeripherals(
-            withServices: nil,
+            withServices: [serviceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
     }
     
     func disconnect() {
-        failConnection ("已断开")
+        //手动断开后暂停自动重连；再次点击扫描按钮可重新开启。
+        autoConnectEnabled = false
+        failConnection ("已断开, 自动连接已暂停")
     }
     
     func unlock() {
@@ -162,6 +172,10 @@ class BluetoothManager: NSObject, ObservableObject {
         statusText = "正在连接 \(deviceName)..."
         debugLog("开始连接 \(peripheral.identifier.uuidString)")
         centralManager.connect(peripheral, options: nil)
+        scheduleConnectionTimeout(for: peripheral)
+    }
+    private func scheduleConnectionTimeout(for peripheral: CBPeripheral) {
+        connectionTimeout?.cancel()
         let session = connectionID
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
@@ -169,13 +183,27 @@ class BluetoothManager: NSObject, ObservableObject {
             self.connectionID == session,
             self.connectedPeripheral === peripheral,
             peripheral.state == .connecting else { return }
-            self.failConnection("连接超时，请靠近重试")
+            self.failConnection("连接超时，将继续自动搜索")
         }
     connectionTimeout = timeout
     DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
-}
+    }
+
+    private func beginServiceDiscovery(for peripheral: CBPeripheral) {
+        guard connectedPeripheral === peripheral else { return }
+        connectionTimeout?.cancel()
+        connectionTimeout = nil
+        isConnected = true
+        isScanning = false
+        setupStage = .discoveringServices
+        statusText = "已连接, 正在发现车钥匙服务..."
+        debugLog("BLE 已连接，开始发现车钥匙和电量服务")
+        schedulePhaseTimeout(message: "服务发现超时", peripheral: peripheral)
+        peripheral.discoverServices([serviceUUID, batteryServiceUUID])
+    }
+
     private func failConnection(_ message: String) {
-        let peripheral = connectedPeripheral
+        let peripheral = connectedPeripheral 
         debugLog(message)
         centralManager.stopScan()
         clearConnectionState()
@@ -183,6 +211,13 @@ class BluetoothManager: NSObject, ObservableObject {
             centralManager.cancelPeripheralConnection(peripheral)
         }
         statusText = message
+
+        if autoConnectEnabled {
+            startScan()
+            if isScanning {
+                statusText = "\(message), 等待自动重连"
+            }
+        }
     }
 
     private func clearConnectionState() {
@@ -564,11 +599,45 @@ class BluetoothManager: NSObject, ObservableObject {
 }
 // MARK: - CBCentralManagerDelegate
 extension BluetoothManager: CBCentralManagerDelegate {
+
+    func centralManager(_ central: CBCentralManager, willRestoreState state: [String: Any]) {
+        let peripherals = state[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
+        guard let peripheral = peripherals.first(where: { $0.state == .connected }) ??
+            peripherals.first(where: { $0.state == .connecting }) ?? peripherals.first else {
+            return
+        }
+        
+        central.stopScan()
+        clearConnectionState()
+        connectedPeripheral = peripheral
+        peripheral.delegate = self
+        debugLog("恢复 IOS 保存的蓝牙状态：\(peripheral.identifier.uuidString)")
+
+        switch peripheral.state {
+            case .connected:
+                //只恢复服务发现和双向认证，不自动发送任何控制指令。
+                beginServiceDiscovery(for: peripheral)
+            case .connecting:
+                statusText = "正在恢复后台连接..."
+                scheduleConnectionTimeout(for: peripheral)
+            case .disconnecting:
+                statusText = "后台连接正在断开，等待自动重连..."
+            default:
+                if autoConnectEnabled {
+                    connect(to: peripheral)
+                } else {
+                    clearConnectionState()
+                }
+        }
+    }
+    
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         switch central.state {
         case .poweredOn:
-            if connectedPeripheral == nil && !isScanning {
-                statusText = "蓝牙已开启，可以开始扫描"
+            if connectedPeripheral == nil && autoConnectEnabled {
+                startScan()
+            } else if !autoConnectEnabled {
+                statusText = "蓝牙已开启，自动连接已暂停"
             }
         case .poweredOff:
             clearConnectionState()
@@ -586,42 +655,29 @@ extension BluetoothManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        guard connectedPeripheral == nil else { return }
+        guard connectedPeripheral == nil, autoConnectEnabled else { return }
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
-        guard advertisedName == deviceName || peripheral.name == deviceName else { return }
+        let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+        guard advertisedName == deviceName || peripheral.name == deviceName ||
+                advertisedServices.contains(serviceUUID) else { return }
         connect(to: peripheral)
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        guard connectedPeripheral === peripheral else { return }
-        connectionTimeout?.cancel()
-        connectionTimeout = nil
-        isConnected = true
-        isScanning = false
-        setupStage = .discoveringServices
-        statusText = "已连接，正在发现服务..."
-        debugLog("BLE 已连接，开始发现服务")
-        //UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: lastPeripheralKey)
-         schedulePhaseTimeout(message: "服务发现超时",peripheral: peripheral)
-        peripheral.discoverServices(nil)
+        beginServiceDiscovery(for: peripheral)
     }
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, 
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
-        let message = "连接失败: \(error?.localizedDescription ?? "未知错误")"
-        debugLog(message)
-        clearConnectionState()
-        statusText = message
+        failConnection("连接失败: \(error?.localizedDescription ?? "未知错误")")
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, 
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
         let message = error.map{ "连接断开: \($0.localizedDescription)"} ?? "连接已断开"
-        debugLog(message)
-        clearConnectionState()
-        statusText = message
+        failConnection(message)
     }
 }
 
