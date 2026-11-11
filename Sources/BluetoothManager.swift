@@ -12,6 +12,7 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var isAuthenticated: Bool = false
     @Published var isScanning: Bool = false
     @Published private(set) var  autoConnectEnabled: Bool = true
+    @Published private(set) var  backgroundBluetoothEnabled: Bool = false
     @Published var filteredRSSI: Int?
     @Published var batteryLevel: Int?
     @Published var isUnlocked: Bool = false
@@ -112,6 +113,7 @@ class BluetoothManager: NSObject, ObservableObject {
         ) as? [String] ?? []
 
         if backgroundModes.contains("bluetooth-central") {
+            backgroundBluetoothEnabled = true
             options[CBCentralManagerOptionRestoreIdentifierKey] = centralRestoreIdentifier
         } else {
             // 未声明后台模式时启用状态恢复会让 CoreBluetooth 在启动时异常终止。
