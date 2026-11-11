@@ -39,6 +39,13 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
+      - name: Verify Bluetooth background mode
+        run: |
+          APP_PATH=$(find $RUNNER_TEMP/MyFirstiOSApp.xcarchive/Products -name "*.app" | head -n 1)
+          echo "Checking: $APP_PATH/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$APP_PATH/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:0" "$APP_PATH/Info.plist")" = "bluetooth-central"
+
       - name: Package unsigned IPA
         run: |
           APP_PATH=$(find $RUNNER_TEMP/MyFirstiOSApp.xcarchive/Products -name "*.app" | head -n 1)
