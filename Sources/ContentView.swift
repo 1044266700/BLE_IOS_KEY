@@ -31,9 +31,23 @@ struct ContentView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                Text(bluetooth.backgroundBluetoothEnabled ? "蓝牙后台模式：已启用" : "后台自动连接：未启用")
+                Text(bluetooth.backgroundBluetoothEnabled ? "蓝牙后台模式：已启用" : "蓝牙后台模式：未启用")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                
+                HStack {
+                    Label("模块信号强度", systemImage: "antenna.radiowaves.left.adn.right")
+                    Spacer()
+                    if let rssi = bluetooth.filteredRSSI {
+                        Text("\(rssi) dBm")
+                        .fontWeight(.semibold)
+                        .monospacedDigit()
+                    } else {
+                        Text("--")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.top, 4)
                 
                 if let batteryLevel = bluetooth.batteryLevel {
                     VStack(spacing: 6) {
