@@ -519,7 +519,7 @@ class BluetoothManager: NSObject, ObservableObject {
             statusText = "认证会话信息无效，请重新连接"
             return
         }
-        guard let padding = randomBytes(count: 11) else{
+        guard let padding = randomBytes(count: 7) else{
             statusText = "生成指令随机数失败"
             return
         }
