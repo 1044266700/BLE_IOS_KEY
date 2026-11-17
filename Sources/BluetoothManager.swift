@@ -93,6 +93,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var setupStage: SetupStage = .idle
     private var subscriptionStep: NotificationSubscription = .none
     private var phoneNonce: Data?
+    private var commandSessionTag: Data?
     private var connectionID: UInt = 0
 
     private var commandSequence: UInt32 = 0
@@ -260,6 +261,7 @@ class BluetoothManager: NSObject, ObservableObject {
         setupStage = .idle
         subscriptionStep = .none
         phoneNonce = nil
+        commandSessionTag = nil
         commandSequence = 0
         pendingCommand = nil
         pendingCommandSequence = nil
@@ -390,6 +392,7 @@ class BluetoothManager: NSObject, ObservableObject {
         }
 
         phoneNonce = Data(nonce)
+        commandSessionTag = nil
         authState = .waitingForChallengeWrite
         isAuthenticated = false
         statusText = "通知订阅完成，正在发送Challenge..."
@@ -423,6 +426,8 @@ class BluetoothManager: NSObject, ObservableObject {
         responseReadFallback?.cancel()
         responseReadFallback = nil
         phoneNonce = nil
+        // 命令明文绑定本次模块随机数，防止旧会话密文跨会话重放。
+        commandSessionTag = Data(data.suffix(16).prefix(4))
         authState = .waitingForProofWrite
         statusText = "模块已验证，正在验证手机..."
         debugLog("模块响应校验通过，发送proof")
@@ -510,6 +515,10 @@ class BluetoothManager: NSObject, ObservableObject {
             statusText = "指令序号已用尽，请重新连接"
             return
         }
+        guard let sessionTag = commandSessionTag, sessionTag.count == 4 else{
+            statusText = "认证会话信息无效，请重新连接"
+            return
+        }
         guard let padding = randomBytes(count: 11) else{
             statusText = "生成指令随机数失败"
             return
@@ -522,7 +531,8 @@ class BluetoothManager: NSObject, ObservableObject {
         plaintext[2] = UInt8(truncatingIfNeeded: sequence >> 8)
         plaintext[3] = UInt8(truncatingIfNeeded: sequence >> 16)
         plaintext[4] = UInt8(truncatingIfNeeded: sequence >> 24)
-        plaintext.replaceSubrange(5..<16, with: padding)
+        plaintext.replaceSubrange(5..<9, with: sessionTag)
+        plaintext.replaceSubrange(9..<16, with: padding)
 
         guard let encrypted = aesECBEncrypt(data: Data(plaintext)) else{
             statusText = "指令加密失败"
