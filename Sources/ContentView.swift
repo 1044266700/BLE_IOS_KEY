@@ -8,7 +8,7 @@ struct ContentView: View {
         VStack(spacing: 30) {
             
             // 标题
-            Text("蓝牙钥匙")
+            Text("AstraKey")
                 .font(.largeTitle)
                 .fontWeight(.bold)
             
