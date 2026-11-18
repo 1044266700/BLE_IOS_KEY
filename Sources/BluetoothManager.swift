@@ -471,7 +471,7 @@ private func attemptDirectReconnect() -> Bool {
 
     private func handleModuleResponse(_ data: Data){
         guard setupStage == .authenticating else { return }
-        if authState == waitingForChallengeWrite {
+        if authState == .waitingForChallengeWrite {
             // 通知可能先于 Challenge 写确认到达，先缓存，确认写成功后再发送 Proof。
             pendingModuleResponse = data
             debugLog("认证响应早于 Challenge 写确认到达，已缓存")
@@ -669,9 +669,9 @@ private func beginOptionalUpdates() {
         if isAuthenticated, pendingCommandWriteConfirmed, pendingCommand != nil {
             commandTimeout?.cancel()
             commandTimeout = nil
-            pendingcommand = nil
-            pendingcommandSequence = nil
-            pendingcommandWriteConfirmed = false
+            pendingCommand = nil
+            pendingCommandSequence = nil
+            pendingCommandWriteConfirmed = false
             statusText = isCalibrating
                 ? "一米标定中"
                 : "模块状态已同步：当前\(isUnlocked ? "已解锁" : "已闭锁")"
