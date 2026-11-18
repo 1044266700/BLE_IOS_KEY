@@ -18,7 +18,6 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var batteryLevel: Int?
     @Published var isUnlocked: Bool = false
     @Published var isNearStable: Bool = false
-    @Published var isApproachArmed: Bool = false
     @Published var isCalibrating: Bool = false
 
     private enum AuthenticationState{
@@ -38,12 +37,6 @@ class BluetoothManager: NSObject, ObservableObject {
         case subscribingNotifications
         case authenticating
         case ready
-    }
-
-    private enum NotificationSubscription {
-        case none
-        case response
-        case status
     }
     
     private enum KeyCommand: UInt8{
@@ -90,15 +83,17 @@ class BluetoothManager: NSObject, ObservableObject {
     ]
     private var authState: AuthenticationState = .idle
     private var setupStage: SetupStage = .idle
-    private var subscriptionStep: NotificationSubscription = .none
+    private var confirmedNotificationUUIDs = Set<CBUUID>()
     private var phoneNonce: Data?
+    private var pendingModuleResponse: Data?
     private var commandSessionTag: Data?
     private var connectionID: UInt = 0
 
     private var commandSequence: UInt32 = 0
     private var pendingCommand: KeyCommand?
     private var pendingCommandSequence: UInt32?
-
+    private var pendingCommandWriteConfirmed = false
+    
     private let pairedPeripheralIdentifierKey = "AstraKey.pairedPeripheralIdentifier"
     private var pairedPeripheralIdentifier: UUID? {
         get {
@@ -157,9 +152,14 @@ class BluetoothManager: NSObject, ObservableObject {
         clearConnectionState()
         resetConnectionTiming()
 
-        //固定模块优先使用已保存的UUID 直连, 失败后退回普通扫描。
-        if allowDirectReconnect && attemptDirectReconnect() {
+        //固定模块优先使用已保存的UUID 直连, ；等待进入范围时不主动取消，也可手动重新扫描。
+        let shouldAttemptDirect = allowDirectReconnect&& pairedPeripheralIdentifier!= nil
+        appendTimingLog(shouldAttemptDirect ? "连接路径：UUID 直接重连｜0 ms" : "连接路径：服务 UUID 扫描｜0 ms")
+        if shouldAttemptDirect && attemptDirectReconnect() {
             return
+        }
+        if shouldAttemptDirect {
+            logConnectionTiming("直连不可用，回退服务扫描")
         }
         
         isScanning = true
@@ -189,12 +189,10 @@ private func attemptDirectReconnect() -> Bool {
             case .connected:
                 beginServiceDiscovery(for: peripheral)
             case .connecting:
-                statusText = "正在恢复固定模块连接..."
-                scheduleConnectionTimeout(for: peripheral)
+                statusText = "等待固定模块进入范围..."
             default:
-                statusText = "正在恢复固定模块连接..."
+                statusText = "等待固定模块进入范围..."
                 centralManager.connect(peripheral, options: nil)
-                scheduleConnectionTimeout(for: peripheral)
         }
         return true
     }
@@ -214,6 +212,17 @@ private func attemptDirectReconnect() -> Bool {
         autoConnectEnabled = false
         failConnection ("已断开, 自动连接已暂停")
     }
+
+    func rescan() {
+        autoConnectEnabled = true
+        let pendingPeripheral = connectedPeripheral
+        centralManager.stopScan()
+        clearConnectionState()
+        if let pendingPeripheral = pendingPeripheral {
+            centralManager.cancelPeripheralConnection(pendingPeripheral)
+        }
+        startScan(allowDirectReconnect: false)
+    }
     
     func unlock() {
         sendCommand(.unlock)
@@ -231,10 +240,12 @@ private func attemptDirectReconnect() -> Bool {
         
         connectedPeripheral = peripheral
         peripheral.delegate = self
-        statusText = directReconnect ? "正在直接重连固定模块..." : "正在连接 \(deviceName)..."
+        statusText = directReconnect ? "等待固定模块进入范围..." : "正在连接 \(deviceName)..."
         debugLog("\(directReconnect ? "直接重连" : "开始连接") \(peripheral.identifier.uuidString)")
         centralManager.connect(peripheral, options: nil)
-        scheduleConnectionTimeout(for: peripheral)
+        if !directReconnect {
+            scheduleConnectionTimeout(for: peripheral)
+        }
     }
     private func scheduleConnectionTimeout(for peripheral: CBPeripheral) {
         connectionTimeout?.cancel()
@@ -301,17 +312,18 @@ private func attemptDirectReconnect() -> Bool {
         batteryLevel = nil
         isUnlocked = false
         isNearStable = false
-        isApproachArmed = false
         isCalibrating = false
 
         authState = .idle
         setupStage = .idle
-        subscriptionStep = .none
+        confirmedNotificationUUIDs.removeAll()
         phoneNonce = nil
+        pendingModuleResponse = nil
         commandSessionTag = nil
         commandSequence = 0
         pendingCommand = nil
         pendingCommandSequence = nil
+        pendingCommandWriteConfirmed = false
         
         challengeCharacteristic = nil
         responseCharacteristic = nil
@@ -378,65 +390,55 @@ private func attemptDirectReconnect() -> Bool {
               command.properties.contains(.write),
               status.properties.contains(.read),
               status.properties.contains(.notify) else {
-            authenticationFailed("模块特征不完整，无法认证")
+            authenticationFailed("模块特征不完整或读写属性不匹配")
             return
         }
         
         setupStage = .subscribingNotifications
         authState = .waitingForResponseNotification
         isAuthenticated = false
-        beginNotificationSubscription(.response)
+        confirmedNotificationUUIDs.removeAll()
+        beginNotificationSubscriptions()
     }
-    private func beginNotificationSubscription(_ step: NotificationSubscription) {
+    private func beginNotificationSubscriptions() {
         guard let peripheral = connectedPeripheral,
+              let response = responseCharacteristic,
+              let status = statusCharacteristic,
               setupStage == .subscribingNotifications else { return }
-
-        let characteristic: CBCharacteristic
-        let title: String
-        switch step {
-            case .response:
-                guard let response = responseCharacteristic else { return }
-                characteristic = response
-                title = "认证响应 （1/2）"
-            case .status:
-                guard let status = statusCharacteristic else { return }
-                characteristic = status
-                title = "模块状态 （2/2）"
-            case .none:
-                return
-        }
-        subscriptionStep = step
-        statusText = "正在订阅\(title)通知..."
-        debugLog("订阅 \(characteristic.uuid.uuidString)")
+        statusText = "正在订阅必要通知..."
         schedulePhaseTimeout(after:8,
-                            message: "订阅\(title)通知超时",
+                            message: "必要通知订阅超时",
                             peripheral: peripheral)
 
-        if characteristic.isNotifying {
-            notificationSubscriptionCompleted(characteristic, for: peripheral)
-        } else {
-            peripheral.setNotifyValue(true, for: characteristic)
+        //两个 CCC 订阅可并行发起，但认证必须等Response 和 Status 都可通知后再开始。
+        for characteristic in [response, status] {
+            debugLog("订阅 \(characteristic.uuid.uuidString)")
+            if characteristic.isNotifying {
+                confirmedNotificationUUIDs.insert(characteristic.uuid)
+            } else {
+                peripheral.setNotifyValue(true, for: characteristic)
+            }
         }
+        startAuthenticationIfNotificationsReady()
     }
 
     private func notificationSubscriptionCompleted(_ characteristic: CBCharacteristic,
                                                   for peripheral: CBPeripheral){
         guard connectedPeripheral === peripheral,
-              setupStage == .subscribingNotifications else { return }
-              debugLog("已订阅 \(characteristic.uuid.uuidString)")
+              setupStage == .subscribingNotifications,
+              characteristic.uuid == responseUUID || characteristic.uuid == statusUUID,
+              characteristic.isNotifying else { return }
+        debugLog("已订阅 \(characteristic.uuid.uuidString)")
+        confirmedNotificationUUIDs.insert(characteristic.uuid)
+        startAuthenticationIfNotificationsReady()
+    }
 
-              switch characteristic.uuid {
-              case responseUUID:
-                  guard subscriptionStep == .response else { return }
-                  beginNotificationSubscription(.status)
-              case statusUUID:
-                  guard subscriptionStep == .status else { return }
-                  subscriptionStep = .none
-                  setupStage = .authenticating
-                  startAuthentication()
-              default :
-                  break
-        }
+    private func startAuthenticationIfNotificationsReady() {
+        guard setupStage == .subscribingNotifications,
+            confirmedNotificationUUIDs.contains(responseUUID),
+            confirmedNotificationUUIDs.contains(statusUUID) else { return }
+        setupStage = .authenticating
+        startAuthentication()
     }
 
 //TODO
@@ -453,6 +455,7 @@ private func attemptDirectReconnect() -> Bool {
         }
 
         phoneNonce = Data(nonce)
+        pendingModuleResponse = nil
         commandSessionTag = nil
         authState = .waitingForChallengeWrite
         isAuthenticated = false
@@ -467,10 +470,17 @@ private func attemptDirectReconnect() -> Bool {
     }
 
     private func handleModuleResponse(_ data: Data){
-        guard setupStage == .authenticating,
-             authState == .waitingForModuleResponse else { return }
+        guard setupStage == .authenticating else { return }
+        if authState == waitingForChallengeWrite {
+            // 通知可能先于 Challenge 写确认到达，先缓存，确认写成功后再发送 Proof。
+            pendingModuleResponse = data
+            debugLog("认证响应早于 Challenge 写确认到达，已缓存")
+            return
+        }
+        guard authState == .waitingForModuleResponse else { return }
+        pendingModuleResponse = nil
         guard data.count == 32 else{
-            authenticationFailed("认证长度错误 ： \(data.count)字节")
+            authenticationFailed("认证响应长度错误 ： \(data.count)字节")
             return
         }
         guard let expectedNonce = phoneNonce,
@@ -506,6 +516,7 @@ private func attemptDirectReconnect() -> Bool {
         phaseTimeout = nil
         responseReadFallback = nil
         phoneNonce = nil
+        pendingModuleResponse = nil
         commandSequence = 0
         setupStage = .ready
         authState = .authenticated
@@ -640,7 +651,6 @@ private func beginOptionalUpdates() {
 
         isUnlocked = status & (1 << 1) != 0
         isNearStable = status & (1 << 2) != 0
-        isApproachArmed = status & (1 << 3) != 0
         isCalibrating = status & (1 << 4) != 0
 
         if moduleAuthenticated  {
@@ -648,13 +658,24 @@ private func beginOptionalUpdates() {
             if authState == .waitingForProofWrite || authState == .waitingForAuthenticationStatus{
                 completeAuthentication()
             }
-        }
-        else if !moduleAuthenticated && (wasAuthenticated || authState == .authenticated){
+        } else if wasAuthenticated || authState == .authenticated {
             failConnection ("模块认证已失效，请重新连接")
             return 
         }
         // UI 与发送指令使用同一判定
         isAuthenticated = moduleAuthenticated && authState == .authenticated
+
+        // 写确认前到达的通知只更新状态；写确认后的状态才结束本次命令等待。
+        if isAuthenticated, pendingCommandWriteConfirmed, pendingCommand != nil {
+            commandTimeout?.cancel()
+            commandTimeout = nil
+            pendingcommand = nil
+            pendingcommandSequence = nil
+            pendingcommandWriteConfirmed = false
+            statusText = isCalibrating
+                ? "一米标定中"
+                : "模块状态已同步：当前\(isUnlocked ? "已解锁" : "已闭锁")"
+        }
     }
 
     private func randomBytes(count: Int) -> [UInt8]? {
@@ -722,13 +743,12 @@ extension BluetoothManager: CBCentralManagerDelegate {
                 //只恢复服务发现和双向认证，不自动发送任何控制指令。
                 beginServiceDiscovery(for: peripheral)
             case .connecting:
-                statusText = "正在恢复后台连接..."
-                scheduleConnectionTimeout(for: peripheral)
+                statusText = "等待固定模块进入范围..."
             case .disconnecting:
                 statusText = "后台连接正在断开，等待自动重连..."
             default:
                 if autoConnectEnabled {
-                    connect(to: peripheral)
+                    connect(to: peripheral, directReconnect: true)
                 } else {
                     clearConnectionState()
                 }
@@ -764,7 +784,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         guard advertisedName == deviceName || peripheral.name == deviceName ||
                 advertisedServices.contains(serviceUUID) else { return }
-        logConnectionTiming("扫描发现固定模块")
+        logConnectionTiming("扫描发现固定模块，RSSI \(RSSI.intValue) dBm")
         connect(to: peripheral)
     }
     
@@ -924,7 +944,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         
 
         guard characteristic.isNotifying else { 
-                failConnection("通知模块未开启：\(characteristic.uuid.uuidString)")
+                failConnection("模块通知未开启：\(characteristic.uuid.uuidString)")
                 return      
         }
         notificationSubscriptionCompleted(characteristic, for: peripheral)
@@ -986,12 +1006,16 @@ func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBC
             switch authState {
             case .waitingForChallengeWrite:
                 authState = .waitingForModuleResponse
-                statusText = "Challeng 写入成功，等待模块响应..."
-                debugLog("Challeng 写入成功，等待32字节模块响应")
-                schedulePhaseTimeout(after:8,
-                                    message: "认证超时：未收到模块响应",
-                                    peripheral: peripheral)
-                scheduleResponseReadFallback()
+                statusText = "Challenge 写入成功，等待模块响应..."
+                debugLog("Challenge 写入成功，等待32字节模块响应")
+                if let earlyResponse = pendingModuleResponse {
+                    handleModuleResponse(earlyResponse)
+                } else {
+                    schedulePhaseTimeout(after:8,
+                                        message: "认证超时：未收到模块响应",
+                                        peripheral: peripheral)
+                    scheduleResponseReadFallback()
+                }
             case .waitingForProofWrite:
                 authState = .waitingForAuthenticationStatus
                 statusText = "proof写入成功，等待模块认证状态..."
@@ -1010,15 +1034,21 @@ func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBC
 
         case commandUUID:
             guard let command = pendingCommand, pendingCommandSequence != nil else { return }
-            commandTimeout?.cancel()
-            commandTimeout = nil
-            pendingCommand = nil
-            pendingCommandSequence = nil
             if let error = error {
+                commandTimeout?.cancel()
+                commandTimeout = nil
+                pendingCommand = nil
+                pendingCommandSequence = nil
+                pendingCommandWriteConfirmed = false
                 statusText = "\(command.title)指令写入失败：\(error.localizedDescription)"
-            } else {
-                // ATT 写确认不代表解锁条件已满足，实际结果以 Status 通知为准。
-                statusText = "\(command.title)指令已发送，等待模块状态"
+                return
+            } 
+            
+            // ATT 写确认只证明写请求完成，继续等待其后的模块状态，不能当作命令结果。
+            pendingCommandWriteConfirmed = true
+            statusText = "\(command.title)指令已发送，等待模块状态"
+            if let status = statusCharacteristic {
+                peripheral.readValue(for: status)
             }
 
         default:
