@@ -328,11 +328,24 @@ private func attemptDirectReconnect() -> Bool {
 
     private func resetConnectionTiming(){
         connectionFlowStartedAt = CFAbsoluteTimeGetCurrent()
+        appendTimingLog("开始连接流程｜0 ms")
     }
 
     private func logConnectionTiming(_ stage: String){
         let milliseconds = (CFAbsoluteTimeGetCurrent() - connectionFlowStartedAt) * 1000
-        debugLog("阶段耗时｜\(stage) ｜\(Int(milliseconds.rounded())) ms")
+        appendTimingLog("\(stage) ｜\(Int(milliseconds.rounded())) ms")
+    }
+
+    private func appendTimingLog(_ message: String) {
+        timingLogs.append(message)
+        if timingLogs.count > 100 {
+            timingLogs.removeFirst(timingLogs.count - 100)
+        }
+        debugLog("阶段耗时｜\(message)")
+    }
+
+    func clearTimingLogs() {
+        timingLogs.removeAll()
     }
 
     private func schedulePhaseTimeout(after seconds: TimeInterval = 10,
