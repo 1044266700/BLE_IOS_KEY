@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var bluetooth = BluetoothManager()
     @State private var calibrationSessionObserved = false
+    @State private var showingDiagnostics = false
     
     var body: some View {
         VStack(spacing: 30) {
@@ -36,7 +37,7 @@ struct ContentView: View {
                     .foregroundColor(.secondary)
                 
                 HStack {
-                    Label("模块信号强度", systemImage: "antenna.radiowaves.left.adn.right")
+                    Label("模块信号强度", systemImage: "antenna.radiowaves.left.and.right")
                     Spacer()
                     if let rssi = bluetooth.filteredRSSI {
                         Text("\(rssi) dBm")
@@ -137,6 +138,13 @@ struct ContentView: View {
                 }
                 .disabled(!bluetooth.isAuthenticated)
             }
+
+            Button {
+                showingDiagnostics = true
+            } label: {
+                Label("连接诊断", systemImage: "timer")
+                .font(.subheadline)
+            }
             
             Spacer()
             
@@ -145,6 +153,9 @@ struct ContentView: View {
                 .foregroundColor(.secondary)
         }
         .padding(24)
+        .sheet(isPresented: $showingDiagnostics) {
+            TimingDiagnosticsView(bluetooth: bluetooth)
+        }
         .onChange(of: bluetooth.isCalibrating) { isCalibrating in
             if isCalibrating{
                 calibrationSessionObserved = true
@@ -157,7 +168,52 @@ struct ContentView: View {
         }
     }
 }
+private struct TimingDiagnosticsView: View {
+    @ObservedObject var bluetooth: BluetoothManager
+    @Environment(\.dismiss) private var dismiss
 
+    var body: some View{
+        NavigationStack{
+            Group {
+                if bluetooth.timingLogs.isEmpty {
+                    VStack(spacing: 12){
+                        Image(systemName: "timer")
+                            .font(.largeTitle)
+                            .foregroundColor(.secondary)
+                        Text("暂无计时日志")
+                            .foregroundColor(.secondary)
+                        Text("开始连接后，这里会显示各阶段累计耗时")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    List(bluetooth.timingLogs.indices, id: \.self) {index in
+                        Text(bluetooth.timingLogs[index])
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("连接诊断")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("清空") {
+                        bluetooth.clearTimingLogs()
+                    }
+                    .disabled(bluetooth.timingLogs.isEmpty)
+                }
+            }
+        }
+    }
+}
 #Preview {
     ContentView()
 }
