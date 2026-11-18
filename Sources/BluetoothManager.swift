@@ -13,6 +13,7 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var isScanning: Bool = false
     @Published private(set) var  autoConnectEnabled: Bool = true
     @Published private(set) var  backgroundBluetoothEnabled: Bool = false
+    @Published private(set) var  timingLogs: [String] = []
     @Published var filteredRSSI: Int?
     @Published var batteryLevel: Int?
     @Published var isUnlocked: Bool = false
