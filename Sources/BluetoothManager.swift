@@ -19,7 +19,10 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var isUnlocked: Bool = false
     @Published var isNearStable: Bool = false
     @Published var isCalibrating: Bool = false
-
+    @Published private(set) var  isCalibrationBusy: Bool = false
+    @Published private(set) var  calibrationResultText: String?
+    @Published private(set) var  calibrationSucceeded: Bool = false
+    
     private enum AuthenticationState{
         case idle
         case waitingForResponseNotification
@@ -52,6 +55,29 @@ class BluetoothManager: NSObject, ObservableObject {
             }
         }
     }
+
+    private enum CommandResultCode: UInt8 {
+        case success = 0
+        case rejected = 1
+        case busy = 2
+        case notNear = 3
+        case invalidRSSI = 4
+        case insufficientSamples = 5
+        case storageError = 6
+        case started = 7
+        case unsupported = 8
+        case replayed = 9
+        case sessionRejected = 10
+    }
+
+    private struct CommandResult {
+        let command: UInt8
+        let sequence: UInt32
+        let code: CommandResultCode?
+        let rawCode: UInt8
+        let status: UInt8
+    }  
+    
     // MARK: - 私有属性
     private var centralManager: CBCentralManager!
     private var connectedPeripheral: CBPeripheral?
@@ -72,6 +98,8 @@ class BluetoothManager: NSObject, ObservableObject {
     private let commandUUID         = CBUUID(string: "00000004-12BC-4A5E-9C01-23456789ABCD")
     private let rssiUUID            = CBUUID(string: "00000005-12BC-4A5E-9C01-23456789ABCD")
     private let statusUUID          = CBUUID(string: "00000006-12BC-4A5E-9C01-23456789ABCD")
+    private let commandResultMessageType: UInt8 = 0x01
+    private let commandResultLength = 8
     private let batteryServiceUUID  = CBUUID(string: "180F")
     private let batteryLevelUUID    = CBUUID(string: "2A19")
     // =====================================================
@@ -86,6 +114,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var confirmedNotificationUUIDs = Set<CBUUID>()
     private var phoneNonce: Data?
     private var pendingModuleResponse: Data?
+    private var pendingAuthenticationStatus = false
     private var commandSessionTag: Data?
     private var connectionID: UInt = 0
 
@@ -93,6 +122,8 @@ class BluetoothManager: NSObject, ObservableObject {
     private var pendingCommand: KeyCommand?
     private var pendingCommandSequence: UInt32?
     private var pendingCommandWriteConfirmed = false
+    private var pendingCommandResult: CommandResult?
+    private var activeCalibrationSequence: UInt32?
     
     private let pairedPeripheralIdentifierKey = "AstraKey.pairedPeripheralIdentifier"
     private var pairedPeripheralIdentifier: UUID? {
@@ -112,6 +143,9 @@ class BluetoothManager: NSObject, ObservableObject {
     private var phaseTimeout: DispatchWorkItem?
     private var responseReadFallback: DispatchWorkItem?
     private var commandTimeout: DispatchWorkItem?
+    private var calibrationResultTimeout: DispatchWorkItem?
+    private var optionalUpdatesWorkItem: DispatchWorkItem?
+    private var optionalUpdatesStarted = false
     
     override init() {
         super.init()
@@ -298,32 +332,39 @@ private func attemptDirectReconnect() -> Bool {
         connectionID &+= 1
         connectionTimeout?.cancel()
         phaseTimeout?.cancel()
-        responseReadFallback?.cancel()
-        commandTimeout?.cancel()
-        connectionTimeout = nil
-        phaseTimeout = nil
-        responseReadFallback = nil
-        commandTimeout = nil
+        responseReadFallback?.cancel() 
+        calibrationResultTimeout?.cancel() 
+        optionalUpdatesWorkItem?.cancel() 
+        connectionTimeout = nil 
+        phaseTimeout = nil 
+        responseReadFallback = nil 
+        calibrationResultTimeout = nil 
+        optionalUpdatesWorkItem = nil 
+        optionalUpdatesStarted = false 
+        resetPendingCommand() 
         
-        isConnected = false
-        isScanning = false
-        isAuthenticated = false
-        filteredRSSI = nil
-        batteryLevel = nil
-        isUnlocked = false
-        isNearStable = false
-        isCalibrating = false
-
-        authState = .idle
-        setupStage = .idle
-        confirmedNotificationUUIDs.removeAll()
-        phoneNonce = nil
-        pendingModuleResponse = nil
-        commandSessionTag = nil
-        commandSequence = 0
-        pendingCommand = nil
-        pendingCommandSequence = nil
-        pendingCommandWriteConfirmed = false
+        isConnected = false 
+        isScanning = false 
+        isAuthenticated = false 
+        filteredRSSI = nil 
+        batteryLevel = nil 
+        isUnlocked = false 
+        isNearStable = false 
+        isCalibrating = false 
+        isCalibrationBusy = false 
+        calibrationResultText = nil 
+        calibrationSucceeded = false 
+        
+        authState = .idle 
+        setupStage = .idle 
+        confirmedNotificationUUIDs.removeAll() 
+        phoneNonce = nil 
+        pendingModuleResponse = nil 
+        pendingAuthenticationStatus = false 
+        commandSessionTag = nil 
+        commandSequence = 0 
+        
+        activeCalibrationSequence = nil 
         
         challengeCharacteristic = nil
         responseCharacteristic = nil
@@ -333,6 +374,17 @@ private func attemptDirectReconnect() -> Bool {
         batteryCharacteristic = nil
         connectedPeripheral?.delegate = nil
         connectedPeripheral = nil
+    }
+
+    private func resetPendingCommand() {
+        commandTimeout?.cancel()
+        responseReadFallback?.cancel()
+        commandTimeout = nil
+        responseReadFallback = nil
+        pendingCommand = nil
+        pendingCommandSequence = nil
+        pendingCommandWriteConfirmed = false
+        pendingCommandResult = nil
     }
 
     private func debugLog(_ message: String){
@@ -456,6 +508,7 @@ private func attemptDirectReconnect() -> Bool {
 
         phoneNonce = Data(nonce)
         pendingModuleResponse = nil
+        pendingAuthenticationStatus = false
         commandSessionTag = nil
         authState = .waitingForChallengeWrite
         isAuthenticated = false
@@ -510,32 +563,54 @@ private func attemptDirectReconnect() -> Bool {
         // 第二步返回 AES(module_nonce)，此时还不能宣告双向认证成功。
         peripheral.writeValue(proof, for: challenge, type: .withResponse)
     }
-    private func completeAuthentication(){
+
+    private func completeAuthentication() {
+        guard authState == .waitingForAuthenticationStatus,
+              let peripheral = connectedPeripheral else { return }
         phaseTimeout?.cancel()
         responseReadFallback?.cancel()
         phaseTimeout = nil
         responseReadFallback = nil
         phoneNonce = nil
         pendingModuleResponse = nil
+        pendingAuthenticationStatus = false
         commandSequence = 0
         setupStage = .ready
         authState = .authenticated
         isAuthenticated = true
+        pairedPeripheralIdentifier = peripheral.identifier
         statusText = "双向认证完成"
-        debugLog("双向认证完成")
-        logConnectionTiming("双向认证完成, 可以发送指令")
-        beginOptionalUpdates()
-    }  
+        debugLog("双向认证完成，已保存固定模块 UUID")
+        logConnectionTiming("双向认证完成，可以发送指令")
+        scheduleOptionalUpdates(after: 2)
+    }
 
-private func beginOptionalUpdates() {
-    guard setupStage == .ready,
-            let peripheral = connectedPeripheral else { return }
-
-    // 以下功能不参与认证，失败时只记录日志，不影响钥匙指令。
-    if let rssi = rssiCharacteristic {
-        if rssi.properties.contains(.read) {
-            peripheral.readValue(for: rssi)
+    private func scheduleOptionalUpdates(after seconds: TimeInterval) {
+        guard setupStage == .ready, !optionalUpdatesStarted else { return }
+        optionalUpdatesWorkItem?.cancel()
+        let session = connectionID
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.connectionID == session,
+                  self.setupStage == .ready else { return }
+            self.beginOptionalUpdates()
         }
+        optionalUpdatesWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: work)
+    }
+
+    private func beginOptionalUpdates() {
+        guard setupStage == .ready,
+              !optionalUpdatesStarted,
+              let peripheral = connectedPeripheral else { return }
+        optionalUpdatesStarted = true
+        optionalUpdatesWorkItem?.cancel()
+        optionalUpdatesWorkItem = nil
+        // RSSI 和电量在认证及首条指令之外处理，失败不影响钥匙指令。
+        if let rssi = rssiCharacteristic {
+            if rssi.properties.contains(.read) {
+                peripheral.readValue(for: rssi)
+            }
         if rssi.properties.contains(.notify), !rssi.isNotifying {
             peripheral.setNotifyValue(true, for: rssi)
         }
@@ -586,6 +661,47 @@ private func beginOptionalUpdates() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: timeout)
     }
 
+    private func scheduleCommandResultReadFallback(after seconds: TimeInterval = 0.35) {
+        responseReadFallback?.cancel()
+        let session = connectionID
+        let commandSeq = pendingCommandSequence
+        let calibrationSeq = activeCalibrationSequence
+        let read = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.connectionID == session,
+                  self.setupStage == .ready,
+                  let peripheral = self.connectedPeripheral,
+                  let response = self.responseCharacteristic else { return }
+    
+            if let sequence = commandSeq {
+                guard self.pendingCommandSequence == sequence,
+                      self.pendingCommandWriteConfirmed else { return }
+            } else if let sequence = calibrationSeq {
+                guard self.activeCalibrationSequence == sequence else { return }
+            } else {
+                return
+            }
+    
+            self.debugLog("命令结果通知未到达，回退读取 Response")
+            peripheral.readValue(for: response)
+        }
+        responseReadFallback = read
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: read)
+    }
+
+    private func scheduleCalibrationResultTimeout(for sequence: UInt32) {
+        calibrationResultTimeout?.cancel()
+        let session = connectionID
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.connectionID == session,
+                  self.activeCalibrationSequence == sequence else { return }
+            self.failConnection("标定结果确认超时，为安全起见已断开")
+        }
+        calibrationResultTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: timeout)
+    }
+
 // MARK: 加密控制指令
     private func sendCommand(_ command: KeyCommand) {
         guard isConnected,
@@ -598,6 +714,10 @@ private func beginOptionalUpdates() {
         }
         guard pendingCommand == nil else{
             statusText = "上一条指令尚未确认，请稍后"
+            return
+        }
+        guard !isCalibrationBusy else {
+            statusText = "标定结果确认中，请稍后再发送指令"
             return
         }
         guard commandSequence < UInt32.max else{
@@ -628,54 +748,206 @@ private func beginOptionalUpdates() {
             return
         }
 
+        optionalUpdatesWorkItem?.cancel()
+        optionalUpdatesWorkItem = nil
+        if command == .calibrateOneMeter {
+            isCalibrationBusy = true
+            calibrationResultText = nil
+            calibrationSucceeded = false
+        }
 
         commandSequence = sequence
         pendingCommand = command 
         pendingCommandSequence = sequence
+        pendingCommandWriteConfirmed = false
+        pendingCommandResult = nil
         statusText = "正在发送\(command.title)指令..."
         scheduleCommandTimeout(for: sequence, peripheral: peripheral)
         peripheral.writeValue(encrypted, for: characteristic, type: .withResponse)
     }
 
-//MARK 状态与随机数
+    //MARK 状态与随机数
     private func handleStatus(_ data: Data) {
-        guard data.count == 1 else{
-            if authState == .waitingForAuthenticationStatus {
+        guard data.count == 1 else {
+            if authState == .waitingForProofWrite || authState == .waitingForAuthenticationStatus {
                 authenticationFailed("模块状态长度错误")
             }
             return
         }
         let status = data[0]
-        let moduleAuthenticated  = status & (1 << 0) != 0
-        let  wasAuthenticated = isAuthenticated
-
+        let moduleAuthenticated = status & (1 << 0) != 0
+        let wasAuthenticated = isAuthenticated
+        let wasUnlocked = isUnlocked
+        let wasCalibrating = isCalibrating
+    
         isUnlocked = status & (1 << 1) != 0
         isNearStable = status & (1 << 2) != 0
         isCalibrating = status & (1 << 4) != 0
-
-        if moduleAuthenticated  {
-            //只有手机 proof已发出后，才接受模块的认证成功状态
-            if authState == .waitingForProofWrite || authState == .waitingForAuthenticationStatus{
+    
+        if moduleAuthenticated {
+            switch authState {
+            case .waitingForProofWrite:
+                // 模块通知可能先于 Proof 的 ATT 写确认，先缓存，不能提前开放指令。
+                if !pendingAuthenticationStatus {
+                    debugLog("认证成功状态早于 Proof 写确认到达，已缓存")
+                }
+                pendingAuthenticationStatus = true
+            case .waitingForAuthenticationStatus:
                 completeAuthentication()
+            default:
+                break
             }
+        } else if authState == .waitingForAuthenticationStatus {
+            authenticationFailed("模块未接受手机 Proof")
+            return
         } else if wasAuthenticated || authState == .authenticated {
-            failConnection ("模块认证已失效，请重新连接")
-            return 
+            failConnection("模块认证已失效，请重新连接")
+            return
         }
-        // UI 与发送指令使用同一判定
+    
+        // UI 与发送指令使用同一判定。
         isAuthenticated = moduleAuthenticated && authState == .authenticated
-
-        // 写确认前到达的通知只更新状态；写确认后的状态才结束本次命令等待。
-        if isAuthenticated, pendingCommandWriteConfirmed, pendingCommand != nil {
-            commandTimeout?.cancel()
-            commandTimeout = nil
-            pendingCommand = nil
-            pendingCommandSequence = nil
-            pendingCommandWriteConfirmed = false
-            statusText = isCalibrating
-                ? "一米标定中"
-                : "模块状态已同步：当前\(isUnlocked ? "已解锁" : "已闭锁")"
+    
+        if wasCalibrating && !isCalibrating && isCalibrationBusy,
+           activeCalibrationSequence != nil {
+            // 标定采样已结束但最终结果通知可能丢失，读取最新 Response 补齐。
+            scheduleCommandResultReadFallback(after: 0.25)
         }
+
+        // 周期 Status 只同步模块状态，绝不能当作某条命令的执行结果。
+        if setupStage == .ready, pendingCommand == nil,
+           wasUnlocked != isUnlocked || wasCalibrating != isCalibrating {
+            if isCalibrating {
+                statusText = "一米标定进行中，请保持手机静止"
+            } else if !isCalibrationBusy {
+                statusText = "模块状态已同步：当前\(isUnlocked ? "已解锁" : "已闭锁")"
+            }
+        }
+    }
+
+    private func handleCommandResult(_ data: Data) {
+        guard data.count == commandResultLength,
+              data[0] == commandResultMessageType else {
+            debugLog("忽略未知 Response 数据：\(data.count) 字节")
+            return
+        }
+        let rawCode = data[6]
+        let result = CommandResult(
+            command: data[1],
+            sequence: UInt32(data[2]) |
+                (UInt32(data[3]) << 8) |
+                (UInt32(data[4]) << 16) |
+                (UInt32(data[5]) << 24),
+            code: CommandResultCode(rawValue: rawCode),
+            rawCode: rawCode,
+            status: data[7]
+        )
+        processCommandResult(result)
+    }
+
+    private func processCommandResult(_ result: CommandResult) {
+        guard setupStage == .ready else {
+            debugLog("忽略非就绪阶段的命令结果")
+            return
+        }
+        // 标定开始后可异步返回最终结果，此时最初的命令等待已经结束。
+        if result.command == KeyCommand.calibrateOneMeter.rawValue,
+           result.sequence == activeCalibrationSequence {
+            if result.code == .started {
+                // Flash 尚未完成时 Read 可能仍得到 Started，继续读取直至最终结果到达。
+                scheduleCommandResultReadFallback(after: 0.5)
+            } else {
+                finishCalibration(with: result)
+            }
+            return
+        }
+        guard let command = pendingCommand,
+              command.rawValue == result.command,
+              pendingCommandSequence == result.sequence else {
+            debugLog("忽略过期或不匹配的命令结果：cmd=\(result.command) seq=\(result.sequence)")
+            return
+        }
+        guard pendingCommandWriteConfirmed else {
+            pendingCommandResult = result
+            debugLog("命令结果早于 ATT 写确认到达，已缓存：seq=\(result.sequence)")
+            return
+        }
+        completePendingCommand(command, with: result)
+    }
+    
+    private func completePendingCommand(_ command: KeyCommand, with result: CommandResult) {
+        resetPendingCommand()
+        handleStatus(Data([result.status]))
+        guard setupStage == .ready else { return }
+
+        if command == .calibrateOneMeter {
+            if result.code == .started {
+                activeCalibrationSequence = result.sequence
+                isCalibrationBusy = true
+                calibrationResultText = nil
+                calibrationSucceeded = false
+                statusText = "一米标定进行中，请保持手机在 1 米处静止"
+                scheduleCalibrationResultTimeout(for: result.sequence)
+                scheduleCommandResultReadFallback(after: 3.5)
+            } else {
+                finishCalibration(with: result)
+            }
+            return
+        }
+    
+        switch result.code {
+        case .success:
+            statusText = "\(command.title)完成：当前\(isUnlocked ? "已解锁" : "已闭锁")"
+        case .notNear:
+            statusText = "解锁失败：请靠近车辆并保持信号稳定"
+        case .busy:
+            statusText = "\(command.title)失败：模块忙"
+        case .replayed:
+            statusText = "\(command.title)失败：序号无效或重复"
+        case .sessionRejected:
+            statusText = "\(command.title)失败：认证会话不匹配"
+        case .unsupported:
+            statusText = "模块不支持\(command.title)指令"
+        case .rejected:
+        statusText = "\(command.title)指令被模块拒绝"
+        default:
+            statusText = "\(command.title)失败：结果码 \(result.rawCode)"
+        }
+        scheduleOptionalUpdates(after: 0.5)
+    }
+            
+    private func finishCalibration(with result: CommandResult) {
+        calibrationResultTimeout?.cancel()
+        responseReadFallback?.cancel()
+        calibrationResultTimeout = nil
+        responseReadFallback = nil
+        activeCalibrationSequence = nil
+        isCalibrationBusy = false
+        handleStatus(Data([result.status]))
+        guard setupStage == .ready else { return }
+
+        switch result.code {
+        case .success:
+            calibrationSucceeded = true
+            calibrationResultText = "标定完成，1 米阈值已保存"
+        case .insufficientSamples:
+            calibrationSucceeded = false
+            calibrationResultText = "标定失败：有效 RSSI 样本不足"
+        case .invalidRSSI:
+            calibrationSucceeded = false
+            calibrationResultText = "标定失败：RSSI 不在有效范围"
+        case .storageError:
+            calibrationSucceeded = false
+            calibrationResultText = "标定值已生效，但 Flash 保存失败"
+        case .busy:
+            calibrationSucceeded = false
+            calibrationResultText = "标定失败：Flash 存储忙"
+        default:
+            calibrationSucceeded = false
+            calibrationResultText = "标定失败：结果码 \(result.rawCode)"
+        }
+        statusText = calibrationResultText ?? "标定已结束"
+        scheduleOptionalUpdates(after: 0.5)
     }
 
     private func randomBytes(count: Int) -> [UInt8]? {
@@ -726,36 +998,52 @@ extension BluetoothManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, willRestoreState state: [String: Any]) {
         resetConnectionTiming()
         let peripherals = state[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] ?? []
-        guard let peripheral = peripherals.first(where: { $0.state == .connected }) ??
-            peripherals.first(where: { $0.state == .connecting }) ?? peripherals.first else {
+        let candidates: [CBPeripheral]
+        if let identifier = pairedPeripheralIdentifier {
+            candidates = peripherals.filter { $0.identifier == identifier }
+        } else {
+            candidates = peripherals
+        }
+        guard let peripheral = candidates.first(where: { $0.state == .connected }) ??
+                candidates.first(where: { $0.state == .connecting }) ?? candidates.first else {
+            debugLog("忽略未配对模块的状态恢复记录")
             return
         }
-        
+
         central.stopScan()
         clearConnectionState()
         connectedPeripheral = peripheral
         peripheral.delegate = self
-        pairedPeripheralIdentifier = peripheral.identifier
-        debugLog("恢复 IOS 保存的蓝牙状态：\(peripheral.identifier.uuidString)")
+        debugLog("恢复 iOS 保存的蓝牙状态：\(peripheral.identifier.uuidString)")
 
         switch peripheral.state {
-            case .connected:
-                //只恢复服务发现和双向认证，不自动发送任何控制指令。
-                beginServiceDiscovery(for: peripheral)
-            case .connecting:
-                statusText = "等待固定模块进入范围..."
-            case .disconnecting:
-                statusText = "后台连接正在断开，等待自动重连..."
-            default:
-                if autoConnectEnabled {
-                    connect(to: peripheral, directReconnect: true)
-                } else {
-                    clearConnectionState()
-                }
+        case .connected:
+            // 只恢复服务发现和双向认证，不自动发送任何控制指令。
+            beginServiceDiscovery(for: peripheral)
+        case .connecting:
+            statusText = "等待固定模块进入范围..."
+        case .disconnecting:
+            statusText = "后台连接正在断开，等待自动重连..."
+        default:
+            if autoConnectEnabled {
+                connect(to: peripheral, directReconnect: true)
+            } else {
+                clearConnectionState()
+            }
         }
     }
-    
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        func handleUnavailable(_ message: String) {
+            let peripheral = connectedPeripheral
+            central.stopScan()
+            clearConnectionState()
+            if let peripheral = peripheral {
+                central.cancelPeripheralConnection(peripheral)
+            }
+            statusText = message
+        }
+    
         switch central.state {
         case .poweredOn:
             if connectedPeripheral == nil && autoConnectEnabled {
@@ -764,16 +1052,17 @@ extension BluetoothManager: CBCentralManagerDelegate {
                 statusText = "蓝牙已开启，自动连接已暂停"
             }
         case .poweredOff:
-            clearConnectionState()
-            statusText = "蓝牙已关闭"
+            handleUnavailable("蓝牙已关闭")
         case .unauthorized:
-            clearConnectionState()
-            statusText = "没有蓝牙权限"
+            handleUnavailable("没有蓝牙权限")
         case .unsupported:
-            clearConnectionState()
-            statusText = "当前设备不支持蓝牙"
-        default:
-            statusText = "蓝牙不可用"
+            handleUnavailable("当前设备不支持蓝牙")
+        case .resetting:
+            handleUnavailable("蓝牙正在复位")
+        case .unknown:
+            handleUnavailable("蓝牙状态未知")
+        @unknown default:
+            handleUnavailable("蓝牙不可用")
         }
     }
     
@@ -790,7 +1079,6 @@ extension BluetoothManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard connectedPeripheral === peripheral else { return }
-        pairedPeripheralIdentifier = peripheral.identifier
         logConnectionTiming("BLE 链路已连接")
         beginServiceDiscovery(for: peripheral)
     }
@@ -958,6 +1246,8 @@ func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CB
             case responseUUID:
                 if authState == .waitingForModuleResponse {
                     authenticationFailed("读取认证响应失败：\(error.localizedDescription)")
+                } else if pendingCommand != nil || activeCalibrationSequence != nil {
+                    failConnection("读取命令结果失败：\(error.localizedDescription)，为安全起见已断开")
                 }
             case statusUUID:
                 if authState == .waitingForAuthenticationStatus {
@@ -974,7 +1264,11 @@ func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CB
 
         switch characteristic.uuid {
         case responseUUID:
-            handleModuleResponse(data)
+            if data.count == commandResultLength, data[0] == commandResultMessageType {
+                handleCommandResult(data)
+            } else {
+                handleModuleResponse(data)
+            }
         case rssiUUID:
             guard data.count == 1 else { return }
             filteredRSSI = Int(Int8(bitPattern: data[0]))
@@ -1019,9 +1313,14 @@ func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBC
             case .waitingForProofWrite:
                 authState = .waitingForAuthenticationStatus
                 statusText = "proof写入成功，等待模块认证状态..."
-                debugLog("proof写入成功，等待模块认证状态")
-                schedulePhaseTimeout(after:8,
-                                    message: "认证超时：未收到模块认证响应",
+                if pendingAuthenticationStatus {
+                    debugLog("Proof 写确认到达，消费提前到达的认证成功状态")
+                    completeAuthentication()
+                    return
+                }
+                debugLog("Proof 写入成功，读取模块状态")
+                schedulePhaseTimeout(after: 8,
+                                     message: "认证超时：未收到模块认证状态",
                                     peripheral: peripheral)
                 guard let status = statusCharacteristic else{
                     authenticationFailed("模块状态特征不可用")
@@ -1035,20 +1334,27 @@ func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBC
         case commandUUID:
             guard let command = pendingCommand, pendingCommandSequence != nil else { return }
             if let error = error {
-                commandTimeout?.cancel()
-                commandTimeout = nil
-                pendingCommand = nil
-                pendingCommandSequence = nil
-                pendingCommandWriteConfirmed = false
+                resetPendingCommand()
+                if command == .calibrateOneMeter {
+                    calibrationResultTimeout?.cancel()
+                    calibrationResultTimeout = nil
+                    activeCalibrationSequence = nil
+                    isCalibrationBusy = false
+                    calibrationSucceeded = false
+                    calibrationResultText = "标定指令写入失败：\(error.localizedDescription)"
+                }
                 statusText = "\(command.title)指令写入失败：\(error.localizedDescription)"
+                scheduleOptionalUpdates(after: 0.5)
                 return
-            } 
-            
-            // ATT 写确认只证明写请求完成，继续等待其后的模块状态，不能当作命令结果。
+            }
+        
+            // ATT 写确认只证明请求已写入；执行结果必须匹配命令和序号。
             pendingCommandWriteConfirmed = true
-            statusText = "\(command.title)指令已发送，等待模块状态"
-            if let status = statusCharacteristic {
-                peripheral.readValue(for: status)
+            statusText = "\(command.title)指令已发送，等待模块结果"
+            if let earlyResult = pendingCommandResult {
+                processCommandResult(earlyResult)
+            } else {
+                scheduleCommandResultReadFallback()
             }
 
         default:
