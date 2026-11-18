@@ -139,11 +139,21 @@ struct ContentView: View {
                 .disabled(!bluetooth.isAuthenticated)
             }
 
-            Button {
-                showingDiagnostics = true
-            } label: {
-                Label("连接诊断", systemImage: "timer")
-                .font(.subheadline)
+            HStack(spacing: 24) {
+                Button {
+                    showingDiagnostics = true
+                } label: {
+                    Label("连接诊断", systemImage: "timer")
+                    .font(.subheadline)
+                }
+                if bluetooth.autoConnectEnabled && !bluetooth.isConnect {
+                    Button {
+                        bluetooth.rescan()
+                    } label: {
+                        Label("重新扫描", systemImage: "arrow.clockwise")
+                        .font(.subheadline)
+                    }
+                }
             }
             
             Spacer()
