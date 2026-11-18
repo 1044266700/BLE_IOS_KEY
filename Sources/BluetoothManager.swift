@@ -153,7 +153,7 @@ class BluetoothManager: NSObject, ObservableObject {
         resetConnectionTiming()
 
         //固定模块优先使用已保存的UUID 直连, ；等待进入范围时不主动取消，也可手动重新扫描。
-        let shouldAttemptDirect = allowDirectReconnect && pairedPeripheralIdentifier!= nil
+        let shouldAttemptDirect = allowDirectReconnect && pairedPeripheralIdentifier != nil
         appendTimingLog(shouldAttemptDirect ? "连接路径：UUID 直接重连｜0 ms" : "连接路径：服务 UUID 扫描｜0 ms")
         if shouldAttemptDirect && attemptDirectReconnect() {
             return
