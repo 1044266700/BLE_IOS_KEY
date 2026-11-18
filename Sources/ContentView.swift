@@ -146,7 +146,7 @@ struct ContentView: View {
                     Label("连接诊断", systemImage: "timer")
                     .font(.subheadline)
                 }
-                if bluetooth.autoConnectEnabled && !bluetooth.isConnect {
+                if bluetooth.autoConnectEnabled && !bluetooth.isConnected {
                     Button {
                         bluetooth.rescan()
                     } label: {
