@@ -632,7 +632,7 @@ private func attemptDirectReconnect() -> Bool {
     private func notificationSubscriptionCompleted(_ characteristic: CBCharacteristic,
                                                   for peripheral: CBPeripheral){
         guard connectedPeripheral === peripheral,
-              setupStage == .subscribingNotifications,
+              setupStage == .authenticating || setupStage == .ready,
               characteristic.uuid == responseUUID || characteristic.uuid == statusUUID,
               characteristic.isNotifying else { return }
         debugLog("已订阅 \(characteristic.uuid.uuidString)")
