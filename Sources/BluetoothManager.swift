@@ -3,6 +3,7 @@ import CoreBluetooth
 import CommonCrypto
 import Combine
 import Security
+import UIKit
 
 class BluetoothManager: NSObject, ObservableObject {
     
@@ -22,6 +23,7 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published private(set) var  isCalibrationBusy: Bool = false
     @Published private(set) var  calibrationResultText: String?
     @Published private(set) var  calibrationSucceeded: Bool = false
+    @Published private(set) var isWaitingForProximity: Bool = false
     
     private enum AuthenticationState{
         case idle
@@ -146,6 +148,23 @@ class BluetoothManager: NSObject, ObservableObject {
     private var calibrationResultTimeout: DispatchWorkItem?
     private var optionalUpdatesWorkItem: DispatchWorkItem?
     private var optionalUpdatesStarted = false
+
+    // 直连挂起期间的并行扫描回退，用于发现更换后的新模块。
+    private let directReconnectFallbackScanDelay: TimeInterval = 4
+    private var directFallbackScanWorkItem: DispatchWorkItem?
+    private var isFallbackScanActive = false
+    private var ignoredPeripheralIdentifiers = Set<UUID>()
+    
+    // 断开后的自动重连与失败退避。
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var consecutiveConnectionFailures = 0
+    
+    // willRestoreState 早于 poweredOn，先保存外设，等蓝牙可用后再处理。
+    private var restoredPeripheral: CBPeripheral?
+    
+    // 认证后模块仍需积累 RSSI 样本，解锁先等待近区稳定，超时后照常发送。
+    private let unlockProximityWaitTimeout: TimeInterval = 1.5
+    private var pendingUnlockWorkItem: DispatchWorkItem?
     
     override init() {
         super.init()
@@ -168,6 +187,13 @@ class BluetoothManager: NSObject, ObservableObject {
             queue: nil,
             options: options.isEmpty ? nil : options
         )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
     
     // MARK: - 对外方法
@@ -185,8 +211,9 @@ class BluetoothManager: NSObject, ObservableObject {
         centralManager.stopScan()
         clearConnectionState()
         resetConnectionTiming()
-
-        //固定模块优先使用已保存的UUID 直连, ；等待进入范围时不主动取消，也可手动重新扫描。
+        restoredPeripheral = nil
+        
+        //固定模块优先UUID 直连, ；等待进入范围时不主动取消，也可手动重新扫描。
         let shouldAttemptDirect = allowDirectReconnect && pairedPeripheralIdentifier != nil
         appendTimingLog(shouldAttemptDirect ? "连接路径：UUID 直接重连｜0 ms" : "连接路径：服务 UUID 扫描｜0 ms")
         if shouldAttemptDirect && attemptDirectReconnect() {
@@ -214,19 +241,14 @@ private func attemptDirectReconnect() -> Bool {
     if let peripheral = centralManager.retrieveConnectedPeripherals(
         withServices: [serviceUUID]
     ).first(where: {$0.identifier == identifier}) {
-        connectedPeripheral = peripheral
-        peripheral.delegate = self
-        isScanning = false
         debugLog("找到系统已连接的固定模块：\(identifier.uuidString)")
-
-        switch peripheral.state {
-            case .connected:
-                beginServiceDiscovery(for: peripheral)
-            case .connecting:
-                statusText = "等待固定模块进入范围..."
-            default:
-                statusText = "等待固定模块进入范围..."
-                centralManager.connect(peripheral, options: nil)
+        if peripheral.state == .connected {
+            connectedPeripheral = peripheral
+            peripheral.delegate = self
+            isScanning = false
+            beginServiceDiscovery(for: peripheral)
+        } else {
+            connect(to: peripheral, directReconnect: true)
         }
         return true
     }
@@ -252,6 +274,8 @@ private func attemptDirectReconnect() -> Bool {
         let pendingPeripheral = connectedPeripheral
         centralManager.stopScan()
         clearConnectionState()
+        consecutiveConnectionFailures = 0
+        ignoredPeripheralIdentifiers.removeAll()
         if let pendingPeripheral = pendingPeripheral {
             centralManager.cancelPeripheralConnection(pendingPeripheral)
         }
@@ -259,15 +283,48 @@ private func attemptDirectReconnect() -> Bool {
     }
     
     func unlock() {
-        sendCommand(.unlock)
+        guard !isWaitingForProximity else { return }
+        // 刚认证完成时模块还在积累 RSSI 样本，先等待近区稳定，避免必然被拒。
+        guard setupStage == .ready,
+              isAuthenticated,
+              !isNearStable,
+              pendingCommand == nil,
+              !isCalibrationBusy else {
+            sendCommand(.unlock)
+            return
+        }
+        isWaitingForProximity = true
+        statusText = "正在确认距离..."
+        let session = connectionID
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.connectionID == session,
+                  self.isWaitingForProximity else { return }
+            self.debugLog("等待近区稳定超时，照常发送解锁指令")
+            self.finishUnlockWait(send: true)
+        }
+        pendingUnlockWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + unlockProximityWaitTimeout, execute: work)
     }
     func lock() {
+        finishUnlockWait(send: false)
         sendCommand(.lock)
     }
     func calibrateAtOneMeter() {
+        finishUnlockWait(send: false)
         sendCommand(.calibrateOneMeter)
     }
 
+    private func finishUnlockWait(send: Bool) {
+        guard isWaitingForProximity else { return }
+        pendingUnlockWorkItem?.cancel()
+        pendingUnlockWorkItem = nil
+        isWaitingForProximity = false
+        if send {
+            sendCommand(.unlock)
+        }
+    }
+    
     private func connect(to peripheral: CBPeripheral, directReconnect: Bool = false) {
         centralManager.stopScan()
         clearConnectionState()
@@ -277,10 +334,61 @@ private func attemptDirectReconnect() -> Bool {
         statusText = directReconnect ? "等待固定模块进入范围..." : "正在连接 \(deviceName)..."
         debugLog("\(directReconnect ? "直接重连" : "开始连接") \(peripheral.identifier.uuidString)")
         centralManager.connect(peripheral, options: nil)
-        if !directReconnect {
+        if directReconnect {
+            scheduleDirectFallbackScan(for: peripheral)
+        } else {
             scheduleConnectionTimeout(for: peripheral)
         }
     }
+
+    /// 直连挂起不会超时；前台等待数秒后并行扫描服务，发现其他模块（如更换模块）时再切换。
+    private func scheduleDirectFallbackScan(for peripheral: CBPeripheral) {
+        directFallbackScanWorkItem?.cancel()
+        let session = connectionID
+        let work = DispatchWorkItem { [weak self, weak peripheral] in
+            guard let self = self,
+                  let peripheral = peripheral,
+                  self.connectionID == session else { return }
+            self.directFallbackScanWorkItem = nil
+            self.startDirectFallbackScan(for: peripheral)
+        }
+        directFallbackScanWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + directReconnectFallbackScanDelay, execute: work)
+    }
+
+    private func startDirectFallbackScan(for peripheral: CBPeripheral) {
+        guard autoConnectEnabled,
+              !isFallbackScanActive,
+              centralManager.state == .poweredOn,
+              connectedPeripheral === peripheral,
+              peripheral.state == .connecting,
+              peripheral.identifier == pairedPeripheralIdentifier,
+              UIApplication.shared.applicationState == .active else { return }
+        isFallbackScanActive = true
+        debugLog("直连等待中，前台并行扫描车钥匙服务")
+        centralManager.scanForPeripherals(
+            withServices: [serviceUUID],
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
+    }
+
+    private func stopDirectFallbackScan() {
+        directFallbackScanWorkItem?.cancel()
+        directFallbackScanWorkItem = nil
+        if isFallbackScanActive {
+            centralManager.stopScan()
+            isFallbackScanActive = false
+        }
+    }
+
+    @objc private func applicationDidBecomeActive() {
+        // 等待期在后台结束时，回到前台补上并行扫描；等待期未结束则交给定任务。
+        guard directFallbackScanWorkItem == nil,
+              let peripheral = connectedPeripheral,
+              peripheral.state == .connecting else { return }
+        startDirectFallbackScan(for: peripheral)
+    }
+
     private func scheduleConnectionTimeout(for peripheral: CBPeripheral) {
         connectionTimeout?.cancel()
         let session = connectionID
@@ -292,44 +400,94 @@ private func attemptDirectReconnect() -> Bool {
             peripheral.state == .connecting else { return }
             self.failConnection("连接超时，将继续自动搜索")
         }
-    connectionTimeout = timeout
-    DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
+        connectionTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
     }
 
     private func beginServiceDiscovery(for peripheral: CBPeripheral) {
         guard connectedPeripheral === peripheral else { return }
+        stopDirectFallbackScan()
         connectionTimeout?.cancel()
         connectionTimeout = nil
         isConnected = true
         isScanning = false
         setupStage = .discoveringServices
         statusText = "已连接, 正在发现车钥匙服务..."
-        debugLog("BLE 已连接，开始发现车钥匙和电量服务")
+        debugLog("BLE 已连接，优先发现车钥匙服务")
         schedulePhaseTimeout(message: "服务发现超时", peripheral: peripheral)
         peripheral.discoverServices([serviceUUID])
     }
 
-    private func failConnection(_ message: String) {
-        let peripheral = connectedPeripheral 
+    /// - Parameter linkLost: 链路层断开/连接失败；已认证会话的链路断开会立即重新挂起直连。
+    private func failConnection(_ message: String, linkLost: Bool = false) {
+        let peripheral = connectedPeripheral
+        let wasAuthenticated = authState == .authenticated
+        // 主动取消仍会收到 didDisconnect，需等回调结束后再重连，否则会被误判为新连接断开。
+        let needsCancel = peripheral.map { $0.state != .disconnected } ?? false
         debugLog(message)
         centralManager.stopScan()
         clearConnectionState()
-        if let peripheral = peripheral {
+        if needsCancel, let peripheral = peripheral {
             centralManager.cancelPeripheralConnection(peripheral)
         }
         statusText = message
 
-        if autoConnectEnabled {
-            //本轮直连已经失败时先扫描，避免对同一个 UUID 反复等待连接超时
-            startScan(allowDirectReconnect: false)
-            if isScanning {
+        // 并行扫描切换到的新模块未通过认证时，本次运行内不再尝试它，回到已配对模块。
+        if let peripheral = peripheral,
+           let paired = pairedPeripheralIdentifier,
+           peripheral.identifier != paired,
+           !wasAuthenticated {
+            ignoredPeripheralIdentifiers.insert(peripheral.identifier)
+        }
+
+        guard autoConnectEnabled else { return }
+
+        if wasAuthenticated && linkLost {
+            // 正常使用中离开范围；立即重新挂起 UUID 直连，靠近即连。
+            consecutiveConnectionFailures = 0
+        } else {
+            consecutiveConnectionFailures += 1
+        }
+        // 前两次失败立即重试；持续失败（如密钥不匹配被模块断开）再指数退避。
+        // 上限 8 秒，保证后台被唤醒的执行窗口内仍能重新发起连接。
+        let backoff: TimeInterval = consecutiveConnectionFailures <= 2
+            ? 0
+            : min(pow(2, Double(consecutiveConnectionFailures - 2)), 8)
+        scheduleReconnect(after: max(backoff, needsCancel ? 1 : 0), message: message)
+    }
+
+    private func scheduleReconnect(after delay: TimeInterval, message: String) {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        guard delay > 0 else {
+            startScan()
+            if connectedPeripheral != nil || isScanning {
                 statusText = "\(message), 等待自动重连"
             }
+            return
         }
+
+        statusText = "\(message), \(Int(delay)) 秒后重连"
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.autoConnectEnabled,
+                  self.connectedPeripheral == nil,
+                  !self.isScanning else { return }
+            self.reconnectWorkItem = nil
+            self.startScan()
+        }
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func clearConnectionState() {
         connectionID &+= 1
+        stopDirectFallbackScan()
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
+        pendingUnlockWorkItem?.cancel()
+        pendingUnlockWorkItem = nil
+        isWaitingForProximity = false
         connectionTimeout?.cancel()
         phaseTimeout?.cancel()
         responseReadFallback?.cancel() 
@@ -578,6 +736,10 @@ private func attemptDirectReconnect() -> Bool {
         setupStage = .ready
         authState = .authenticated
         isAuthenticated = true
+        consecutiveConnectionFailures = 0
+        if pairedPeripheralIdentifier != peripheral.identifier {
+            ignoredPeripheralIdentifiers.removeAll()
+        }
         pairedPeripheralIdentifier = peripheral.identifier
         statusText = "双向认证完成"
         debugLog("双向认证完成，已保存固定模块 UUID")
@@ -807,7 +969,11 @@ private func attemptDirectReconnect() -> Bool {
     
         // UI 与发送指令使用同一判定。
         isAuthenticated = moduleAuthenticated && authState == .authenticated
-    
+
+        if isWaitingForProximity && isNearStable && isAuthenticated {
+            finishUnlockWait(send: true)
+        }
+        
         if wasCalibrating && !isCalibrating && isCalibrationBusy,
            activeCalibrationSequence != nil {
             // 标定采样已结束但最终结果通知可能丢失，读取最新 Response 补齐。
@@ -1005,31 +1171,33 @@ extension BluetoothManager: CBCentralManagerDelegate {
             candidates = peripherals
         }
         guard let peripheral = candidates.first(where: { $0.state == .connected }) ??
-                candidates.first(where: { $0.state == .connecting }) ?? candidates.first else {
+              candidates.first(where: { $0.state == .connecting }) ?? candidates.first else {
             debugLog("忽略未配对模块的状态恢复记录")
             return
         }
 
-        central.stopScan()
-        clearConnectionState()
-        connectedPeripheral = peripheral
+        // 此时蓝牙尚未 poweredOn，不能发起任何 GATT 或连接操作，留到 poweredOn 处理。
+        restoredPeripheral = peripheral
         peripheral.delegate = self
-        debugLog("恢复 iOS 保存的蓝牙状态：\(peripheral.identifier.uuidString)")
+        debugLog("恢复 iOS 保存的蓝牙状态: \(peripheral.identifier.uuidString)")
+    }
 
+    private func resumeRestoredPeripheral(_ peripheral: CBPeripheral) {
+        centralManager.stopScan()
         switch peripheral.state {
         case .connected:
             // 只恢复服务发现和双向认证，不自动发送任何控制指令。
+            connectedPeripheral = peripheral
+            peripheral.delegate = self
             beginServiceDiscovery(for: peripheral)
         case .connecting:
+            connectedPeripheral = peripheral
+            peripheral.delegate = self
             statusText = "等待固定模块进入范围..."
-        case .disconnecting:
-            statusText = "后台连接正在断开，等待自动重连..."
+            scheduleDirectFallbackScan(for: peripheral)
+
         default:
-            if autoConnectEnabled {
-                connect(to: peripheral, directReconnect: true)
-            } else {
-                clearConnectionState()
-            }
+            connect(to: peripheral, directReconnect: true)
         }
     }
 
@@ -1046,7 +1214,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
     
         switch central.state {
         case .poweredOn:
-            if connectedPeripheral == nil && autoConnectEnabled {
+            if let restored = restoredPeripheral, autoConnectEnabled {
+                restoredPeripheral = nil
+                resumeRestoredPeripheral(restored)
+            } else if connectedPeripheral == nil && autoConnectEnabled {
                 startScan()
             } else if !autoConnectEnabled {
                 statusText = "蓝牙已开启，自动连接已暂停"
@@ -1068,13 +1239,28 @@ extension BluetoothManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String : Any], rssi RSSI: NSNumber) {
-        guard connectedPeripheral == nil, autoConnectEnabled else { return }
+        guard autoConnectEnabled,
+              !ignoredPeripheralIdentifiers.contains(peripheral.identifier) else { return }
+
+        // 并行扫描时已配对模块的挂起连接仍在，只有发现其他模块才需要切换。
+        let pendingDirectPeripheral = isFallbackScanActive ? connectedPeripheral : nil
+        if isFallbackScanActive {
+            guard let pending = pendingDirectPeripheral,
+                  pending.state == .connecting,
+                  pending.identifier != peripheral.identifier else { return }
+        } else {
+            guard connectedPeripheral == nil else { return }
+        }
+
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let advertisedServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
         guard advertisedName == deviceName || peripheral.name == deviceName ||
-                advertisedServices.contains(serviceUUID) else { return }
-        logConnectionTiming("扫描发现固定模块，RSSI \(RSSI.intValue) dBm")
+              advertisedServices.contains(serviceUUID) else { return }
+        logConnectionTiming("扫描发现固定模块, RSSI \(RSSI.intValue) dBm")
         connect(to: peripheral)
+        if let pendingDirectPeripheral = pendingDirectPeripheral {
+            central.cancelPeripheralConnection(pendingDirectPeripheral)
+        }
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -1086,14 +1272,14 @@ extension BluetoothManager: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, 
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
-        failConnection("连接失败: \(error?.localizedDescription ?? "未知错误")")
+        failConnection("连接失败: \(error?.localizedDescription ?? "未知错误")", linkLost: true)
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, 
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
         let message = error.map{ "连接断开: \($0.localizedDescription)"} ?? "连接已断开"
-        failConnection(message)
+        failConnection(message,, linkLost: true)
     }
 }
 
