@@ -39,7 +39,6 @@ class BluetoothManager: NSObject, ObservableObject {
         case idle
         case discoveringServices
         case discoveringCharacteristics
-        case subscribingNotifications
         case authenticating
         case ready
     }
@@ -604,23 +603,22 @@ private func attemptDirectReconnect() -> Bool {
             return
         }
         
-        setupStage = .subscribingNotifications
+        setupStage = .authenticating
         authState = .waitingForResponseNotification
         isAuthenticated = false
         confirmedNotificationUUIDs.removeAll()
+
+        // Challenge 先入队，避免两个 CCCD 写操作阻塞认证；通知订阅随后并行完成。
+        startAuthentication()
         beginNotificationSubscriptions()
     }
     private func beginNotificationSubscriptions() {
         guard let peripheral = connectedPeripheral,
               let response = responseCharacteristic,
               let status = statusCharacteristic,
-              setupStage == .subscribingNotifications else { return }
-        statusText = "正在订阅必要通知..."
-        schedulePhaseTimeout(after:8,
-                            message: "必要通知订阅超时",
-                            peripheral: peripheral)
+              setupStage == .authenticating else { return }
 
-        //两个 CCC 订阅可并行发起，但认证必须等Response 和 Status 都可通知后再开始。
+        //两个 CCC 订阅并行发起，不阻断已经开始的AES认证。
         for characteristic in [response, status] {
             debugLog("订阅 \(characteristic.uuid.uuidString)")
             if characteristic.isNotifying {
@@ -629,7 +627,6 @@ private func attemptDirectReconnect() -> Bool {
                 peripheral.setNotifyValue(true, for: characteristic)
             }
         }
-        startAuthenticationIfNotificationsReady()
     }
 
     private func notificationSubscriptionCompleted(_ characteristic: CBCharacteristic,
@@ -640,14 +637,6 @@ private func attemptDirectReconnect() -> Bool {
               characteristic.isNotifying else { return }
         debugLog("已订阅 \(characteristic.uuid.uuidString)")
         confirmedNotificationUUIDs.insert(characteristic.uuid)
-        startAuthenticationIfNotificationsReady()
-    }
-
-    private func startAuthenticationIfNotificationsReady() {
-        guard setupStage == .subscribingNotifications,
-            confirmedNotificationUUIDs.contains(responseUUID) else { return }
-        setupStage = .authenticating
-        startAuthentication()
     }
 
 //TODO
@@ -669,9 +658,9 @@ private func attemptDirectReconnect() -> Bool {
         commandSessionTag = nil
         authState = .waitingForChallengeWrite
         isAuthenticated = false
-        statusText = "通知订阅完成，正在发送Challenge..."
-        debugLog("发送16字节Challenge")
-        logConnectionTiming("必要通知订阅完成, 开始认证")
+        statusText = "正在优先发送Challenge..."
+        debugLog("发送16字节Challenge，通知订阅并行进行")
+        logConnectionTiming("开始认证，Challenge 优先提交")
         schedulePhaseTimeout(after:8,
                     message: "认证超时：challenge写入未确认",
                     peripheral: peripheral)
