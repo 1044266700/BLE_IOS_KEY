@@ -1279,7 +1279,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
                         error: Error?) {
         guard connectedPeripheral === peripheral else { return }
         let message = error.map{ "连接断开: \($0.localizedDescription)"} ?? "连接已断开"
-        failConnection(message,, linkLost: true)
+        failConnection(message, linkLost: true)
     }
 }
 
