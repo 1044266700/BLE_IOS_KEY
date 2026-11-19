@@ -645,8 +645,7 @@ private func attemptDirectReconnect() -> Bool {
 
     private func startAuthenticationIfNotificationsReady() {
         guard setupStage == .subscribingNotifications,
-            confirmedNotificationUUIDs.contains(responseUUID),
-            confirmedNotificationUUIDs.contains(statusUUID) else { return }
+            confirmedNotificationUUIDs.contains(responseUUID) else { return }
         setupStage = .authenticating
         startAuthentication()
     }
