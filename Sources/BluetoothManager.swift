@@ -141,6 +141,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var connectionFlowStartedAt = CFAbsoluteTimeGetCurrent()
     
     private var connectionTimeout: DispatchWorkItem?
+    private var quickReconnectAttempted = false
     private var phaseTimeout: DispatchWorkItem?
     private var responseReadFallback: DispatchWorkItem?
     private var commandTimeout: DispatchWorkItem?
@@ -241,6 +242,7 @@ private func reuseSystemConnectedPeripheral() -> Bool {
 
     func rescan() {
         autoConnectEnabled = true
+        quickReconnectAttempted = false
         let pendingPeripheral = connectedPeripheral
         centralManager.stopScan()
         clearConnectionState()
@@ -309,17 +311,51 @@ private func reuseSystemConnectedPeripheral() -> Bool {
 
     private func scheduleConnectionTimeout(for peripheral: CBPeripheral) {
         connectionTimeout?.cancel()
+        let useQuickRetry = !quickReconnectAttempted
+        if useQuickRetry {
+            quickReconnectAttempted = true
+        }
         let session = connectionID
         let timeout = DispatchWorkItem { [weak self, weak peripheral] in
             guard let self = self,
-            let peripheral = peripheral,
-            self.connectionID == session,
-            self.connectedPeripheral === peripheral,
-            peripheral.state == .connecting else { return }
-            self.failConnection("连接超时，将继续自动搜索")
+                  let peripheral = peripheral,
+                  self.connectionID == session,
+                  self.connectedPeripheral === peripheral,
+                  peripheral.state == .connecting else { return }
+            if useQuickRetry {
+                self.rescanAfterQuickTimeout(peripheral)
+            } else {
+                self.failConnection("连接超时，将继续自动搜索")
+            }
         }
         connectionTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + 15, execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (useQuickRetry ? 2 : 15), execute: timeout)
+    }
+
+    private func rescanAfterQuickTimeout(_ peripheral: CBPeripheral) {
+        logConnectionTiming("首次连接 2 秒未成功，重新扫描重试")
+        centralManager.stopScan()
+        clearConnectionState()
+        centralManager.cancelPeripheralConnection(peripheral)
+        statusText = "正在重新搜索 BLE_KEY..."
+
+        // 等待取消旧连接的回调结束，再用最新广播重试；本轮只快速重试一次。
+        let session = connectionID
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self,
+                  self.connectionID == session,
+                  self.autoConnectEnabled,
+                  self.connectedPeripheral == nil,
+                  self.centralManager.state == .poweredOn else { return }
+            self.reconnectWorkItem = nil
+            self.isScanning = true
+            self.centralManager.scanForPeripherals(
+                withServices: [self.serviceUUID],
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+            )
+        }
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
     }
 
     private func beginServiceDiscovery(for peripheral: CBPeripheral) {
@@ -556,7 +592,6 @@ private func reuseSystemConnectedPeripheral() -> Bool {
         confirmedNotificationUUIDs.insert(characteristic.uuid)
     }
 
-//TODO
     private func startAuthentication() {
         guard let peripheral = connectedPeripheral,
               let characteristic = challengeCharacteristic,
@@ -606,7 +641,7 @@ private func reuseSystemConnectedPeripheral() -> Bool {
             return
         }
         guard let proof = aesECBEncrypt(data: Data(data.suffix(16))),
-              let peripheral = connectedPeripheral,          // 正确解包
+              let peripheral = connectedPeripheral, 
               let challenge = challengeCharacteristic else {
             authenticationFailed("生成手机认证应答失败")
             return
@@ -693,7 +728,7 @@ private func reuseSystemConnectedPeripheral() -> Bool {
 }
 
     private func authenticationFailed(_ message: String){
-        // 认证失败后模块可能还在等待proof
+        // 认证失败后模块可能还在等待Proof，必须断开以清除模块认证状态。
         failConnection(message)
     }
 
@@ -1084,7 +1119,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         // 此时蓝牙尚未 poweredOn，不能发起任何 GATT 或连接操作，留到 poweredOn 处理。
         restoredPeripheral = peripheral
         peripheral.delegate = self
-        debugLog("恢复 iOS 保存的蓝牙状态: \(peripheral.identifier.uuidString)")
+        debugLog("恢复 iOS 保存的蓝牙状态：\(peripheral.identifier.uuidString)")
     }
 
     private func resumeRestoredPeripheral(_ peripheral: CBPeripheral) {
@@ -1155,6 +1190,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard connectedPeripheral === peripheral else { return }
+        quickReconnectAttempted = false
         logConnectionTiming("BLE 链路已连接")
         beginServiceDiscovery(for: peripheral)
     }
