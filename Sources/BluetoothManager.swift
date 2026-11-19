@@ -212,8 +212,9 @@ class BluetoothManager: NSObject, ObservableObject {
         resetConnectionTiming()
         restoredPeripheral = nil
         
-        //固定模块优先UUID 直连, ；等待进入范围时不主动取消，也可手动重新扫描。
-        let shouldAttemptDirect = allowDirectReconnect && pairedPeripheralIdentifier != nil
+        //前台扫描可在模块进入范围后立即发现；后台继续 UUID 直连以保证系统自动唤醒连接。
+        let isForeground = UIApplication.shared.applicationState == .active
+        let shouldAttemptDirect = allowDirectReconnect && pairedPeripheralIdentifier != nil && !isForeground
         appendTimingLog(shouldAttemptDirect ? "连接路径：UUID 直接重连｜0 ms" : "连接路径：服务 UUID 扫描｜0 ms")
         if shouldAttemptDirect && attemptDirectReconnect() {
             return
@@ -381,11 +382,11 @@ private func attemptDirectReconnect() -> Bool {
     }
 
     @objc private func applicationDidBecomeActive() {
-        // 等待期在后台结束时，回到前台补上并行扫描；等待期未结束则交给定任务。
-        guard directFallbackScanWorkItem == nil,
-              let peripheral = connectedPeripheral,
+        // 后台挂起的 UUID 直连回到前台后立即切换服务扫描，不再等待回退定时器。
+             guard let peripheral = connectedPeripheral,
               peripheral.state == .connecting else { return }
-        startDirectFallbackScan(for: peripheral)
+        debugLog("回到前台，取消挂起直连并切换服务扫描")
+        rescan()
     }
 
     private func scheduleConnectionTimeout(for peripheral: CBPeripheral) {
