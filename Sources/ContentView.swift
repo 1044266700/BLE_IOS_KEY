@@ -2,7 +2,6 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var bluetooth = BluetoothManager()
-    @State private var calibrationSessionObserved = false
     @State private var showingDiagnostics = false
     
     var body: some View {
@@ -72,14 +71,20 @@ struct ContentView: View {
                         .padding(.top, 8)
                 }
                 if bluetooth.isCalibrating {
-                    Label("正在标定，请保持手机在1米处静止3秒", systemImage: "ruler")
+                    Label("正在标定，请保持手机在 1 米处静止 3 秒", systemImage: "ruler")
                         .font(.subheadline)
                         .foregroundColor(.orange)
                         .multilineTextAlignment(.center)
-                } else if calibrationSessionObserved && bluetooth.isAuthenticated {
-                    Label("标定完成，1米阈值已更新", systemImage: "checkmark.circle.fill")
-                    .font(.subheadline)
-                    .foregroundColor(.green)
+                } else if bluetooth.isCalibrationBusy {
+                    Label("正在等待标定保存结果", systemImage: "hourglass")
+                        .font(.subheadline)
+                        .foregroundColor(.orange)
+                } else if let result = bluetooth.calibrationResultText {
+                    Label(result, systemImage: bluetooth.calibrationSucceeded ?
+                        "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .foregroundColor(bluetooth.calibrationSucceeded ? .green : .red)
+                        .multilineTextAlignment(.center)
                 }
             }
             .padding()
@@ -107,36 +112,42 @@ struct ContentView: View {
 
                 // 一米标定按钮
                 Button(action: {
-                    calibrationSessionObserved = false
                     bluetooth.calibrateAtOneMeter()
                 }) {
                     HStack{
-                        if bluetooth.isCalibrating {
+                        if bluetooth.isCalibrationBusy {
                             ProgressView()
                                 .tint(.white)
                         }
-                        Text(bluetooth.isCalibrating ? "正在标定..." : "一米标定")
+                        Text(bluetooth.isCalibrating ? "正在标定..." :
+                             (bluetooth.isCalibrationBusy ? "等待保存结果..." : "一米标定"))
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(bluetooth.isAuthenticated && !bluetooth.isCalibrating ? Color.orange : Color.gray)
+                    .background(bluetooth.isAuthenticated && !bluetooth.isCalibrationBusy ? Color.orange : Color.gray)
                     .foregroundColor(.white)
                     .cornerRadius(12)
                 }
-                .disabled(!bluetooth.isAuthenticated || bluetooth.isCalibrating)
+                .disabled(!bluetooth.isAuthenticated || bluetooth.isCalibrationBusy)
                 
                 // 一键解锁按钮
                 Button(action: {
                     bluetooth.unlock()
                 }) {
-                    Text("一键解锁")
+                    HStack{
+                        if bluetooth.isWaitingForProximity {
+                            ProgressView()
+                                .tint(.white)
+                        }
+                        Text(bluetooth.isWaitingForProximity ? "正在确认距离..." : "一键解锁")
+                    }
                         .frame(maxWidth: .infinity)
                         .padding()
-                        .background(bluetooth.isAuthenticated ? Color.green : Color.gray)
+                        .background(bluetooth.isAuthenticated && !bluetooth.isCalibrationBusy ? Color.green : Color.gray)
                         .foregroundColor(.white)
                         .cornerRadius(12)
                 }
-                .disabled(!bluetooth.isAuthenticated)
+                .disabled(!bluetooth.isAuthenticated || bluetooth.isCalibrationBusy || bluetooth.isWaitingForProximity)
             }
 
             HStack(spacing: 24) {
@@ -165,16 +176,6 @@ struct ContentView: View {
         .padding(24)
         .sheet(isPresented: $showingDiagnostics) {
             TimingDiagnosticsView(bluetooth: bluetooth)
-        }
-        .onChange(of: bluetooth.isCalibrating) { isCalibrating in
-            if isCalibrating{
-                calibrationSessionObserved = true
-            }
-        }
-        .onChange(of: bluetooth.isConnected) { isConnected in
-            if !isConnected{
-                calibrationSessionObserved = false
-            }
         }
     }
 }
