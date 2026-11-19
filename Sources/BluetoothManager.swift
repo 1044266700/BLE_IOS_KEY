@@ -329,11 +329,11 @@ private func reuseSystemConnectedPeripheral() -> Bool {
             }
         }
         connectionTimeout = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + (useQuickRetry ? 2 : 15), execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + (useQuickRetry ? 3 : 15), execute: timeout)
     }
 
     private func rescanAfterQuickTimeout(_ peripheral: CBPeripheral) {
-        logConnectionTiming("首次连接 2 秒未成功，重新扫描重试")
+        logConnectionTiming("首次连接 3 秒未成功，重新扫描重试")
         centralManager.stopScan()
         clearConnectionState()
         centralManager.cancelPeripheralConnection(peripheral)
